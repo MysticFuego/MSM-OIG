@@ -1,21 +1,81 @@
+"""
+MSM island layout optimizer.
+
+Packs a fixed collection of structures and monsters (1x1 .. 4x4) onto an island
+grid read from a CSV mask, then fills the leftover space with as many NxN
+"fill" squares as possible, while pulling each piece toward its preferred
+vertical band (big pieces high, small pieces low; structures biased to the top).
+
+Solved lexicographically with CP-SAT:
+    Phase 1  maximise the number of fill squares.
+    Phase 2  freeze that count, then maximise the vertical-gradient score.
+
+This replaces the old single blended objective, whose primary weight
+(~1e8) x score (~2e5) produced objective values near 1e12. Those coefficients
+wrecked CP-SAT's LP relaxation and made the reported optimality gap
+meaningless. The two-phase form is faster and its gap is a real bound on the
+number of fill squares.
+"""
+
+from __future__ import annotations
+
+import csv
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 from ortools.sat.python import cp_model
 
+__all__ = [
+    "Placement",
+    "DISPLAY_COLORS",
+    "load_avail_from_csv",
+    "solve_full_collection_with_fill",
+    "validate_solution",
+    "draw_solution",
+    "export_solution_to_excel",
+]
 
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+SIZES = (1, 2, 3, 4)
+GROUPS = ("structure", "monster")
+
+DISPLAY_COLORS = {
+    "blocked": "#2B2B2B",
+    "empty": "#FFFFFF",
+    "structure": "#4C78A8",
+    "monster": "#E45756",
+    "extra": "#54A24B",
+}
+
+# Where each piece "wants" to sit, as a fraction of grid height.
+TARGET_RATIOS = {
+    "structure": {4: 0.05, 3: 0.12, 2: 0.20, 1: 0.28},
+    "monster": {4: 0.10, 3: 0.32, 2: 0.66, 1: 0.92},
+    "extra": {4: 0.10, 3: 0.32, 2: 0.66, 1: 0.92},
+}
+SIZE_WEIGHT = {4: 6, 3: 4, 2: 2, 1: 1}
+
+# Hard vertical bands used only to shrink the candidate pool for 2x2..4x4.
+# They are a speed heuristic, not a requirement: if the model comes back
+# infeasible the bands are widened automatically and finally dropped.
+# 1x1 pieces are deliberately NOT banded (see module docstring / README notes).
+BAND_DEFAULTS = {
+    "structure": {4: (0.00, 0.40), 3: (0.00, 0.50), 2: (0.00, 0.60)},
+    "monster": {4: (0.00, 0.75), 3: (0.00, 1.00), 2: (0.00, 1.00)},
+}
 
 
+# --------------------------------------------------------------------------- #
+# logging
+# --------------------------------------------------------------------------- #
 def log_print(enabled: bool, msg: str) -> None:
     if enabled:
-        print(f"[{_ts()}] {msg}", flush=True)
+        print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Placement:
     x: int
     y: int
@@ -24,342 +84,570 @@ class Placement:
     group: str
 
 
-def all_valid_top_left(avail: np.ndarray, s: int, log: bool = False, label: str = ""):
+# --------------------------------------------------------------------------- #
+# CSV loading
+# --------------------------------------------------------------------------- #
+_TRUE = {".", "1", "true", "t", "yes", "y", "o", "avail", "available", "open"}
+_FALSE = {"#", "0", "false", "f", "no", "n", "", "-", "x", "na", "n/a", "blocked"}
+
+
+def load_avail_from_csv(path: str, log: bool = False) -> np.ndarray:
+    """Read a grid mask. Returns a bool array, True = usable cell."""
     t0 = time.time()
-    H, W = avail.shape
-    total = max(1, (H - s + 1) * (W - s + 1))
+    rows: list[list[str]] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for raw in csv.reader(f):
+            cells = [str(v).strip() for v in raw]
+            if any(cells):  # skip blank lines
+                rows.append(cells)
+    if not rows:
+        raise ValueError(f"{path}: CSV is empty.")
 
-    if H < s or W < s:
-        coords = []
-    else:
-        blocked = (~avail).astype(np.int16)
-        sat = np.pad(blocked, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
-        window_blocked = sat[s:, s:] - sat[:-s, s:] - sat[s:, :-s] + sat[:-s, :-s]
-        ys, xs = np.where(window_blocked == 0)
-        coords = list(zip(xs.tolist(), ys.tolist()))
-
-    if log:
-        log_print(True, f"   candidates for {label}{s}x{s}: {len(coords)}/{total} windows | {time.time()-t0:.2f}s")
-    return coords
-
-
-def row_gradient_score(s: int, y: int, H: int) -> int:
-    if H <= 1:
-        return 1
-
-    # Target vertical bands by size:
-    # 4x4 -> very top, 3x3 -> upper band, 2x2 -> lower-middle, 1x1 -> bottom.
-    target_ratio = {
-        4: 0.10,
-        3: 0.32,
-        2: 0.66,
-        1: 0.92,
-    }[s]
-    size_weight = {
-        4: 6,
-        3: 4,
-        2: 2,
-        1: 1,
-    }[s]
-
-    center = y + (s - 1) / 2
-    target = target_ratio * (H - 1)
-    max_distance = max(1.0, H - 1)
-    return int(round(size_weight * 1000 * (max_distance - abs(center - target))))
-
-
-def center_y_for_square(s: int, y: int) -> float:
-    return y + (s - 1) / 2
-
-
-def filter_positions_by_band(
-    coords: list[tuple[int, int]],
-    *,
-    s: int,
-    H: int,
-    min_ratio: float,
-    max_ratio: float,
-) -> list[tuple[int, int]]:
-    if not coords:
-        return []
-
-    min_y = min_ratio * (H - 1)
-    max_y = max_ratio * (H - 1)
-    return [
-        (x, y)
-        for (x, y) in coords
-        if min_y <= center_y_for_square(s, y) <= max_y
-    ]
-
-
-def build_band_candidates(
-    coords: list[tuple[int, int]],
-    *,
-    s: int,
-    H: int,
-    required_count: int,
-    log: bool,
-) -> list[tuple[int, int]]:
-    if required_count <= 0:
-        return []
-
-    band_targets = {
-        4: (0.00, 0.75),
-        3: (0.00, 1.00),
-        2: (0.00, 1.00),
-        1: (0.00, 1.00),
-    }
-    min_ratio, max_ratio = band_targets[s]
-    relax_step = 0.06
-
-    while True:
-        filtered = filter_positions_by_band(
-            coords,
-            s=s,
-            H=H,
-            min_ratio=min_ratio,
-            max_ratio=max_ratio,
-        )
-        if len(filtered) >= required_count:
-            if log:
-                log_print(
-                    True,
-                    f"   band {s}x{s}: {len(filtered)} candidates in [{min_ratio:.2f}, {max_ratio:.2f}]",
+    W = max(len(r) for r in rows)
+    H = len(rows)
+    avail = np.zeros((H, W), dtype=bool)
+    for y, row in enumerate(rows):
+        for x, value in enumerate(row):
+            v = value.lower()
+            if v in _TRUE:
+                avail[y, x] = True
+            elif v not in _FALSE:
+                # Report *where*, so a stray character is findable in a 33x33 grid.
+                raise ValueError(
+                    f"{path}: unrecognised cell {value!r} at row {y + 1}, column {x + 1}. "
+                    f"Use '.' for open and '#' for blocked."
                 )
-            return filtered
+        # short rows pad as blocked, which np.zeros already did
 
-        if min_ratio <= 0.0 and max_ratio >= 1.0:
-            if log:
-                log_print(True, f"   band {s}x{s}: fell back to full height with {len(filtered)} candidates")
-            return filtered
+    log_print(log, f"Loaded {W}x{H} from {path} | available={int(avail.sum())} | {time.time() - t0:.2f}s")
+    return avail
 
-        min_ratio = max(0.0, min_ratio - relax_step)
-        max_ratio = min(1.0, max_ratio + relax_step)
+
+# --------------------------------------------------------------------------- #
+# geometry helpers
+# --------------------------------------------------------------------------- #
+def valid_top_left(avail: np.ndarray, s: int) -> list[tuple[int, int]]:
+    """Every (x, y) where an s x s square fits entirely on available cells."""
+    H, W = avail.shape
+    if s < 1 or H < s or W < s:
+        return []
+    if s == 1:
+        ys, xs = np.nonzero(avail)
+    else:
+        blocked = (~avail).astype(np.int32)
+        sat = np.pad(blocked, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+        bad = sat[s:, s:] - sat[:-s, s:] - sat[s:, :-s] + sat[:-s, :-s]
+        ys, xs = np.nonzero(bad == 0)
+    return list(zip(xs.tolist(), ys.tolist()))
+
+
+def gradient_score(group: str, s: int, y: int, H: int) -> int:
+    """
+    Preference score for putting an s x s piece of `group` at row y.
+
+    Integer arithmetic in half-cell units. The old version multiplied by 1000
+    for no reason: centres land on half-integers, so doubling is already exact,
+    and the x1000 inflated every objective coefficient ~500x.
+    """
+    span = max(1, H - 1)
+    centre2 = 2 * y + (s - 1)
+    target2 = int(round(2 * TARGET_RATIOS[group][s] * span))
+    return SIZE_WEIGHT[s] * (2 * span - abs(centre2 - target2))
+
+
+def _greedy_disjoint_count(coords, s: int, H: int, W: int, cap: int) -> int:
+    """
+    How many pairwise-disjoint s x s squares can be taken from `coords`
+    (greedy row-major, so a lower bound on the true maximum). Stops at `cap`.
+
+    Used to reject a band that *contains* enough candidate positions but cannot
+    actually hold enough non-overlapping pieces -- the cause of the old
+    spurious "INFEASIBLE" results.
+    """
+    if cap <= 0:
+        return 0
+    used = np.zeros((H, W), dtype=bool)
+    n = 0
+    for x, y in sorted(coords, key=lambda p: (p[1], p[0])):
+        if used[y : y + s, x : x + s].any():
+            continue
+        used[y : y + s, x : x + s] = True
+        n += 1
+        if n >= cap:
+            break
+    return n
+
+
+def _band_filter(coords, s: int, H: int, lo: float, hi: float):
+    if H <= 1:
+        return list(coords)
+    span = H - 1
+    lo_y, hi_y = lo * span, hi * span
+    return [(x, y) for x, y in coords if lo_y <= y + (s - 1) / 2 <= hi_y]
+
+
+def _band_candidates(coords, *, s, H, W, required, lo, hi, log, label):
+    """Widen the band until it can genuinely hold `required` disjoint pieces."""
+    if required <= 0:
+        return []
+    step = 0.06
+    while True:
+        filtered = _band_filter(coords, s, H, lo, hi)
+        full = lo <= 0.0 and hi >= 1.0
+        if _greedy_disjoint_count(filtered, s, H, W, required) >= required:
+            log_print(log, f"   {label}: {len(filtered)} candidates in band [{lo:.2f}, {hi:.2f}]")
+            return filtered
+        if full:
+            log_print(log, f"   {label}: using full height, {len(filtered)} candidates")
+            return filtered
+        lo = max(0.0, lo - step)
+        hi = min(1.0, hi + step)
+
+
+# --------------------------------------------------------------------------- #
+# model construction
+# --------------------------------------------------------------------------- #
+def _build_model(avail, all_pos, pools, fill_pos, fill_size, sc, mc, *, include_ones):
+    """
+    Shared model skeleton.
+
+    include_ones=False (phase 1) drops the ~2 x |available| 1x1 booleans and
+    every constraint they touch. That is exact, not an approximation: a 1x1
+    piece fits in any free cell, so the only thing 1x1 counts do to the packing
+    is consume cells, which a single capacity bound already expresses.
+    """
+    H, W = avail.shape
+    model = cp_model.CpModel()
+
+    mand: dict[tuple[str, int], dict[tuple[int, int], object]] = {}
+    for group, counts in (("structure", sc), ("monster", mc)):
+        for s in (4, 3, 2):
+            if counts[s] == 0:
+                continue
+            pool = pools[(group, s)]
+            v_map = {p: model.NewBoolVar(f"{group[0]}{s}_{p[0]}_{p[1]}") for p in pool}
+            mand[(group, s)] = v_map
+            model.Add(sum(v_map.values()) == counts[s])
+
+    fill_vars = {p: model.NewBoolVar(f"f{fill_size}_{p[0]}_{p[1]}") for p in fill_pos}
+
+    one_vars: dict[str, dict[tuple[int, int], object]] = {"structure": {}, "monster": {}}
+    if include_ones:
+        for group, cnt in (("structure", sc[1]), ("monster", mc[1])):
+            if cnt <= 0:
+                continue
+            v_map = {p: model.NewBoolVar(f"{group[0]}1_{p[0]}_{p[1]}") for p in all_pos}
+            one_vars[group] = v_map
+            model.Add(sum(v_map.values()) == cnt)
+
+    # Non-overlap. Flat list-of-lists beats a dict keyed by (y, x) tuples, and
+    # AddAtMostOne is a native CP-SAT constraint rather than a generic sum <= 1.
+    cover: list[list] = [[] for _ in range(H * W)]
+    for (_group, s), v_map in mand.items():
+        for (tx, ty), v in v_map.items():
+            for dy in range(s):
+                base = (ty + dy) * W + tx
+                for dx in range(s):
+                    cover[base + dx].append(v)
+    for (tx, ty), v in fill_vars.items():
+        for dy in range(fill_size):
+            base = (ty + dy) * W + tx
+            for dx in range(fill_size):
+                cover[base + dx].append(v)
+
+    for x, y in all_pos:
+        terms = cover[y * W + x]
+        sv = one_vars["structure"].get((x, y))
+        mv = one_vars["monster"].get((x, y))
+        if sv is not None:
+            terms.append(sv)
+        if mv is not None:
+            terms.append(mv)
+        if len(terms) > 1:
+            model.AddAtMostOne(terms)
+
+    return model, mand, one_vars, fill_vars
+
+
+def _solve(model, *, workers, solver_log, time_limit):
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = int(workers)
+    solver.parameters.log_search_progress = bool(solver_log)
+    if time_limit is not None and time_limit > 0:
+        solver.parameters.max_time_in_seconds = float(time_limit)
+    status = solver.Solve(model)
+    return solver, status
 
 
 def solve_full_collection_with_fill(
     avail: np.ndarray,
-    structures: dict[int, int],
-    monsters: dict[int, int],
+    structures: dict,
+    monsters: dict,
     *,
     log: bool = True,
     solver_log: bool = False,
     workers: int = 8,
     max_time_in_seconds: float | None = None,
-):
-    grand0 = time.time()
+    fill_size: int = 2,
+    fill_leftovers: bool = False,
+    use_bands: bool = True,
+) -> dict:
+    """
+    Returns a dict. On success: ok=True plus `placements` (list[Placement]),
+    `fill_count`, `fill_upper_bound`, `optimal`, timings and the input counts.
+    On failure: ok=False plus `reason`.
+    """
+    t_start = time.time()
     H, W = avail.shape
     avail_cells = int(avail.sum())
-    available_positions = [(x, y) for y in range(H) for x in range(W) if avail[y, x]]
 
-    structure_counts = {s: int(structures.get(s, 0)) for s in [1, 2, 3, 4]}
-    monster_counts = {s: int(monsters.get(s, 0)) for s in [1, 2, 3, 4]}
-    required_totals = {s: structure_counts[s] + monster_counts[s] for s in [1, 2, 3, 4]}
+    if fill_size not in SIZES:
+        # Used to sail through and blow up much later with a KeyError inside the
+        # Excel colour table.
+        raise ValueError(f"fill_size must be one of {list(SIZES)}, got {fill_size!r}.")
 
-    for label, counts in [("structures", structure_counts), ("monsters", monster_counts)]:
+    sc = {s: int(structures.get(s, 0)) for s in SIZES}
+    mc = {s: int(monsters.get(s, 0)) for s in SIZES}
+    req = {s: sc[s] + mc[s] for s in SIZES}
+    for label, counts in (("structures", sc), ("monsters", mc)):
         for s, c in counts.items():
             if c < 0:
-                raise ValueError(f"{label}[{s}] must be non-negative.")
+                raise ValueError(f"{label}[{s}] must be >= 0, got {c}.")
 
-    if sum(required_totals[s] * (s * s) for s in [1, 2, 3, 4]) > avail_cells:
-        return {"ok": False, "reason": "Impossible: required cells exceed available cells."}
-
-    log_print(log, "==============================")
-    log_print(log, "? START: MSM Optimal Layout")
-    log_print(log, f"Grid: {W} x {H} | available cells: {avail_cells}")
-    log_print(log, f"Structures: {structure_counts}")
-    log_print(log, f"Monsters:   {monster_counts}")
-    log_print(log, f"Totals:     {required_totals}")
-    log_print(log, "==============================")
-
-    t0 = time.time()
-    log_print(log, "? [1/6] Building CP-SAT model")
-    model = cp_model.CpModel()
-    log_print(log, f"? Model created | {time.time()-t0:.2f}s")
-
-    t0 = time.time()
-    log_print(log, "? [2/6] Building shared candidate placements")
-    raw_size_candidates = {
-        s: all_valid_top_left(avail, s, log=log, label="size ")
-        for s in [2, 3, 4]
-        if required_totals[s] > 0
-    }
-    size_candidates = {
-        s: build_band_candidates(
-            raw_size_candidates[s],
-            s=s,
-            H=H,
-            required_count=required_totals[s],
-            log=log,
-        )
-        for s in raw_size_candidates
-    }
-    log_print(log, f"? Shared candidates built | {time.time()-t0:.2f}s")
-
-    t0 = time.time()
-    log_print(log, "? [3/6] Creating mandatory vars by group/size")
-    mandatory_vars: dict[tuple[str, int], dict[tuple[int, int], cp_model.IntVar]] = {}
-    for group, counts in [("structure", structure_counts), ("monster", monster_counts)]:
-        for s in [4, 3, 2]:
-            req = counts[s]
-            if req == 0:
-                continue
-            cands = size_candidates.get(s, [])
-            if not cands:
-                return {"ok": False, "reason": f"No placement exists for required {group} {s}x{s} in this grid."}
-            vars_for_group = {
-                (x, y): model.NewBoolVar(f"{group}_{s}x{s}_at_{x}_{y}")
-                for (x, y) in cands
-            }
-            mandatory_vars[(group, s)] = vars_for_group
-            model.Add(sum(vars_for_group.values()) == req)
-            log_print(log, f"   {group} {s}x{s}: {len(vars_for_group)} candidates | required={req}")
-    log_print(log, f"? Mandatory vars built | {time.time()-t0:.2f}s")
-
-    t0 = time.time()
-    log_print(log, "? [4/6] Creating 1x1 vars and extra 2x2 vars")
-    one_by_one_vars = {"structure": {}, "monster": {}}
-    banded_positions_1x1 = build_band_candidates(
-        available_positions,
-        s=1,
-        H=H,
-        required_count=required_totals[1],
-        log=log,
-    )
-    for group, req in [("structure", structure_counts[1]), ("monster", monster_counts[1])]:
-        if req > avail_cells:
-            return {"ok": False, "reason": f"Impossible: required {group} 1x1={req} exceeds available cells={avail_cells}."}
-        vars_for_group = {
-            (x, y): model.NewBoolVar(f"{group}_1x1_{x}_{y}")
-            for (x, y) in banded_positions_1x1
+    big_cells = sum(req[s] * s * s for s in (2, 3, 4))
+    needed = big_cells + req[1]
+    if needed > avail_cells:
+        return {
+            "ok": False,
+            "reason": f"Required cells ({needed}) exceed available cells ({avail_cells}).",
         }
-        one_by_one_vars[group] = vars_for_group
-        model.Add(sum(vars_for_group.values()) == req)
-        log_print(log, f"   {group} 1x1 vars: {len(vars_for_group)} | required={req}")
 
-    fill2_cands = all_valid_top_left(avail, 2, log=log, label="extra ")
-    fill2_vars = {(x, y): model.NewBoolVar(f"extra_2x2_at_{x}_{y}") for (x, y) in fill2_cands}
-    log_print(log, f"? Extra vars built | extra_2x2={len(fill2_vars)} | {time.time()-t0:.2f}s")
+    log_print(log, f"Grid {W}x{H} | avail={avail_cells} | structures={sc} | monsters={mc}")
 
-    t0 = time.time()
-    log_print(log, "? [5/6] Adding non-overlap constraints per available cell")
-    cover_terms = [[[] for _ in range(W)] for __ in range(H)]
+    # ---- candidate positions, computed once per size and reused ------------ #
+    raw: dict[int, list] = {}
+    for s in (2, 3, 4):
+        if req[s] > 0:
+            raw[s] = valid_top_left(avail, s)
+    if fill_size not in raw:
+        raw[fill_size] = valid_top_left(avail, fill_size)  # was recomputed every run
+    all_pos = valid_top_left(avail, 1)
+    fill_pos = raw[fill_size]
 
-    for (group, s), vars_for_group in mandatory_vars.items():
-        for (tx, ty), v in vars_for_group.items():
-            for yy in range(ty, ty + s):
-                for xx in range(tx, tx + s):
-                    cover_terms[yy][xx].append(v)
+    fill_cap = max(0, (avail_cells - needed) // (fill_size * fill_size))
 
-    for (tx, ty), v in fill2_vars.items():
-        cover_terms[ty][tx].append(v)
-        cover_terms[ty][tx + 1].append(v)
-        cover_terms[ty + 1][tx].append(v)
-        cover_terms[ty + 1][tx + 1].append(v)
+    # ---- band pools, with automatic widening on infeasibility -------------- #
+    def make_pools(widen: float):
+        pools = {}
+        for group, counts in (("structure", sc), ("monster", mc)):
+            for s in (4, 3, 2):
+                if counts[s] == 0:
+                    continue
+                coords = raw.get(s, [])
+                if not coords:
+                    return None, f"No {s}x{s} square fits anywhere on this grid ({group})."
+                if use_bands and widen < 1.0:
+                    lo, hi = BAND_DEFAULTS[group][s]
+                    lo, hi = max(0.0, lo - widen), min(1.0, hi + widen)
+                    pool = _band_candidates(
+                        coords, s=s, H=H, W=W, required=counts[s],
+                        lo=lo, hi=hi, log=log, label=f"{group} {s}x{s}",
+                    )
+                else:
+                    pool = coords
+                if not pool:
+                    return None, f"No placement for {group} {s}x{s}."
+                pools[(group, s)] = pool
+        return pools, None
 
-    for (x, y) in available_positions:
-        per_cell = sum(cover_terms[y][x])
-        per_cell += one_by_one_vars["structure"].get((x, y), 0)
-        per_cell += one_by_one_vars["monster"].get((x, y), 0)
-        model.Add(per_cell <= 1)
-    log_print(log, f"? Non-overlap constraints added | {time.time()-t0:.2f}s")
+    # ---- phase 1: maximise fill count ------------------------------------- #
+    budget1 = None if max_time_in_seconds is None else max(1.0, 0.6 * max_time_in_seconds)
+    phase1 = None
+    for attempt, widen in enumerate((0.0, 0.15, 1.0)):
+        pools, err = make_pools(widen)
+        if pools is None:
+            return {"ok": False, "reason": err}
+        model, mand, _, fill_vars = _build_model(
+            avail, all_pos, pools, fill_pos, fill_size, sc, mc, include_ones=False
+        )
+        model.Add(sum(fill_vars.values()) <= fill_cap)
+        model.Maximize(sum(fill_vars.values()))
+        solver, status = _solve(model, workers=workers, solver_log=solver_log, time_limit=budget1)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            phase1 = (pools, mand, fill_vars, solver, status)
+            break
+        if attempt == 0:
+            log_print(log, f"Phase 1 {solver.StatusName(status)} with default bands - widening.")
+        elif attempt == 1:
+            log_print(log, "Phase 1 still infeasible - dropping bands entirely.")
+    if phase1 is None:
+        return {
+            "ok": False,
+            "status": solver.StatusName(status),
+            "reason": (
+                f"No layout exists for these counts on this grid "
+                f"(solver returned {solver.StatusName(status)} even with bands disabled)."
+            ),
+        }
 
-    t0 = time.time()
-    log_print(log, "? [6/6] Objective: maximize extra 2x2, then enforce top-to-bottom size gradient")
-    primary_obj = sum(fill2_vars.values())
-    secondary_terms = []
-    secondary_scale = 1000
+    pools, mand1, fill_vars1, solver1, status1 = phase1
+    best_fill = int(round(solver1.ObjectiveValue()))
+    fill_bound = int(np.floor(solver1.BestObjectiveBound() + 1e-6))
+    t_phase1 = solver1.WallTime()
+    log_print(
+        log,
+        f"Phase 1: fill_{fill_size}x{fill_size}={best_fill} "
+        f"(bound {fill_bound}, cap {fill_cap}) | {solver1.StatusName(status1)} | {t_phase1:.2f}s",
+    )
 
-    for (group, s), vars_for_group in mandatory_vars.items():
-        for (x, y), v in vars_for_group.items():
-            secondary_terms.append((secondary_scale * row_gradient_score(s, y, H)) * v)
+    hint = {
+        "mand": {k: {p: solver1.Value(v) for p, v in vm.items()} for k, vm in mand1.items()},
+        "fill": {p: solver1.Value(v) for p, v in fill_vars1.items()},
+    }
 
-    for group in ["structure", "monster"]:
-        for (x, y), v in one_by_one_vars[group].items():
-            secondary_terms.append((secondary_scale * row_gradient_score(1, y, H)) * v)
+    # ---- phase 2: freeze the fill count, maximise the gradient ------------- #
+    used = time.time() - t_start
+    budget2 = None if max_time_in_seconds is None else max(1.0, max_time_in_seconds - used)
 
-    for (x, y), v in fill2_vars.items():
-        secondary_terms.append((secondary_scale * row_gradient_score(2, y, H)) * v)
+    model, mand, one_vars, fill_vars = _build_model(
+        avail, all_pos, pools, fill_pos, fill_size, sc, mc, include_ones=True
+    )
+    model.Add(sum(fill_vars.values()) == best_fill)
 
-    max_secondary = (
-        sum(len(vars_for_group) for vars_for_group in mandatory_vars.values())
-        + structure_counts[1]
-        + monster_counts[1]
-        + len(fill2_cands)
-    ) * secondary_scale * max(1, 6 * max(1, H - 1))
-    primary_weight = max_secondary + 1
-    model.Maximize(primary_weight * primary_obj + sum(secondary_terms))
-    log_print(log, f"? Objective set | {time.time()-t0:.2f}s")
+    terms = []
+    for (group, s), v_map in mand.items():
+        for (_x, y), v in v_map.items():
+            terms.append(gradient_score(group, s, y, H) * v)
+    for group in GROUPS:
+        for (_x, y), v in one_vars[group].items():
+            terms.append(gradient_score(group, 1, y, H) * v)
+    for (_x, y), v in fill_vars.items():
+        terms.append(gradient_score("extra", fill_size, y, H) * v)
+    model.Maximize(sum(terms))
 
-    log_print(log, "? Starting solver")
-    solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = int(workers)
-    solver.parameters.log_search_progress = bool(solver_log)
-    if max_time_in_seconds is not None:
-        solver.parameters.max_time_in_seconds = float(max_time_in_seconds)
+    # Warm start from phase 1; the 1x1 pieces are left for the solver to place.
+    for key, v_map in mand.items():
+        for p, v in v_map.items():
+            model.AddHint(v, hint["mand"][key][p])
+    for p, v in fill_vars.items():
+        model.AddHint(v, hint["fill"][p])
 
-    status = solver.Solve(model)
-    status_name = solver.StatusName(status)
-    log_print(log, f"? Solver finished: {status_name}")
+    solver2, status2 = _solve(model, workers=workers, solver_log=solver_log, time_limit=budget2)
 
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {"ok": False, "status": status_name, "reason": f"Status: {status_name}."}
-
-    placements = []
-    for (group, s), vars_for_group in mandatory_vars.items():
-        for (x, y), v in vars_for_group.items():
-            if solver.Value(v) == 1:
-                placements.append(Placement(x, y, s, f"{group}_{s}x{s}", group))
-
-    required_one_counts = {"structure": 0, "monster": 0}
-    for group in ["structure", "monster"]:
-        for (x, y), v in one_by_one_vars[group].items():
-            if solver.Value(v) == 1:
-                placements.append(Placement(x, y, 1, f"{group}_1x1", group))
-                required_one_counts[group] += 1
-
-    extra2 = 0
-    for (x, y), v in fill2_vars.items():
-        if solver.Value(v) == 1:
-            placements.append(Placement(x, y, 2, "extra_2x2", "extra"))
-            extra2 += 1
+    if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        placements = _extract(solver2, mand, one_vars, fill_vars, fill_size)
+        gradient_optimal = status2 == cp_model.OPTIMAL
+        t_phase2 = solver2.WallTime()
+        status_name = solver2.StatusName(status2)
+    else:
+        # Safety net: phase 1's layout is always feasible here, so fall back to
+        # it and drop the 1x1 pieces into free cells by preference order.
+        log_print(log, f"Phase 2 returned {solver2.StatusName(status2)} - falling back to phase 1 layout.")
+        placements = _extract(solver1, mand1, {"structure": {}, "monster": {}}, fill_vars1, fill_size)
+        placements += _greedy_ones(avail, placements, sc[1], mc[1], H)
+        gradient_optimal = False
+        t_phase2 = solver2.WallTime()
+        status_name = solver1.StatusName(status1)
 
     occupied = np.zeros_like(avail, dtype=bool)
     for p in placements:
-        occupied[p.y:p.y + p.s, p.x:p.x + p.s] = True
+        occupied[p.y : p.y + p.s, p.x : p.x + p.s] = True
 
-    extra1 = 0
-    for (x, y) in available_positions:
-        if not occupied[y, x]:
-            placements.append(Placement(x, y, 1, "extra_1x1", "extra"))
-            occupied[y, x] = True
-            extra1 += 1
+    if fill_leftovers:
+        for x, y in all_pos:
+            if not occupied[y, x]:
+                placements.append(Placement(x, y, 1, "extra_1x1", "extra"))
+                occupied[y, x] = True
 
+    fill_optimal = status1 == cp_model.OPTIMAL
     log_print(
         log,
-        f"?? DONE | status={status_name} | structure_1x1={required_one_counts['structure']} | "
-        f"monster_1x1={required_one_counts['monster']} | extra2={extra2} | extra1={extra1} | "
-        f"total {time.time()-grand0:.2f}s",
+        f"Done | fill={best_fill} | gradient {'optimal' if gradient_optimal else 'best effort'} "
+        f"| total {time.time() - t_start:.2f}s",
     )
-
-    objective_value = solver.ObjectiveValue()
-    best_bound = solver.BestObjectiveBound()
 
     return {
         "ok": True,
         "status": status_name,
-        "optimal": status == cp_model.OPTIMAL,
+        "optimal": fill_optimal and gradient_optimal,
+        "fill_optimal": fill_optimal,
+        "gradient_optimal": gradient_optimal,
         "W": W,
         "H": H,
         "available_cells": avail_cells,
-        "structures": structure_counts,
-        "monsters": monster_counts,
-        "required_totals": required_totals,
-        "fill_2x2": extra2,
-        "fill_1x1": extra1,
-        "objective_value": objective_value,
-        "best_objective_bound": best_bound,
-        "relative_gap": None if objective_value == 0 else (best_bound - objective_value) / abs(objective_value),
-        "solve_wall_time_seconds": solver.WallTime(),
+        "structures": sc,
+        "monsters": mc,
+        "required_totals": req,
+        "fill_size": fill_size,
+        "fill_count": best_fill,
+        "fill_upper_bound": fill_bound,
+        "fill_capacity": fill_cap,
+        "free_cells": int(avail_cells - occupied.sum()),
+        "phase1_seconds": t_phase1,
+        "phase2_seconds": t_phase2,
+        "solve_wall_time_seconds": t_phase1 + t_phase2,
+        "total_seconds": time.time() - t_start,
         "placements": placements,
     }
+
+
+def _extract(solver, mand, one_vars, fill_vars, fill_size) -> list[Placement]:
+    out: list[Placement] = []
+    for (group, s), v_map in mand.items():
+        for (x, y), v in v_map.items():
+            if solver.Value(v):
+                out.append(Placement(x, y, s, f"{group}_{s}x{s}", group))
+    for group in GROUPS:
+        for (x, y), v in one_vars.get(group, {}).items():
+            if solver.Value(v):
+                out.append(Placement(x, y, 1, f"{group}_1x1", group))
+    for (x, y), v in fill_vars.items():
+        if solver.Value(v):
+            out.append(Placement(x, y, fill_size, f"extra_{fill_size}x{fill_size}", "extra"))
+    return out
+
+
+def _greedy_ones(avail, placements, n_struct, n_monster, H) -> list[Placement]:
+    """Fallback 1x1 placement: best remaining cell by preference, structures first."""
+    occ = np.zeros_like(avail, dtype=bool)
+    for p in placements:
+        occ[p.y : p.y + p.s, p.x : p.x + p.s] = True
+    free = [(x, y) for y in range(avail.shape[0]) for x in range(avail.shape[1]) if avail[y, x] and not occ[y, x]]
+    out = []
+    for group, n in (("structure", n_struct), ("monster", n_monster)):
+        free.sort(key=lambda p: -gradient_score(group, 1, p[1], H))
+        for x, y in free[:n]:
+            out.append(Placement(x, y, 1, f"{group}_1x1", group))
+        free = free[n:]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# validation
+# --------------------------------------------------------------------------- #
+def validate_solution(avail: np.ndarray, sol: dict, structures: dict, monsters: dict) -> list[str]:
+    """
+    Check the solution really is a legal packing. The old notebook only
+    asserted the piece counts; nothing verified overlaps or blocked cells.
+    Returns a list of problems (empty means the layout is sound).
+    """
+    problems: list[str] = []
+    H, W = avail.shape
+    occ = np.zeros((H, W), dtype=int)
+    tally = {"structure": Counter(), "monster": Counter(), "extra": Counter()}
+
+    for p in sol["placements"]:
+        if p.x < 0 or p.y < 0 or p.x + p.s > W or p.y + p.s > H:
+            problems.append(f"piece outside the grid: {p}")
+            continue
+        if not avail[p.y : p.y + p.s, p.x : p.x + p.s].all():
+            problems.append(f"piece on a blocked cell: {p}")
+        occ[p.y : p.y + p.s, p.x : p.x + p.s] += 1
+        tally[p.group][p.s] += 1
+
+    overlaps = int((occ > 1).sum())
+    if overlaps:
+        problems.append(f"{overlaps} cell(s) covered by more than one piece")
+
+    for label, want in (("structure", structures), ("monster", monsters)):
+        expected = {s: int(want.get(s, 0)) for s in SIZES}
+        got = {s: int(tally[label][s]) for s in SIZES}
+        if got != expected:
+            problems.append(f"{label} counts {got} != requested {expected}")
+
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+def draw_solution(avail: np.ndarray, sol: dict, ax=None, show: bool = True):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    H, W = avail.shape
+    fs = sol["fill_size"]
+    if ax is None:
+        _fig, ax = plt.subplots(figsize=(max(12, W / 2.2), max(10, H / 2.2)))
+
+    bg = np.where(avail[:, :, None], [1.0, 1.0, 1.0], [43 / 255, 43 / 255, 43 / 255])
+    ax.imshow(bg, interpolation="none", origin="upper")
+
+    for p in sol["placements"]:
+        ax.add_patch(
+            mpatches.Rectangle(
+                (p.x - 0.5, p.y - 0.5), p.s, p.s,
+                facecolor=DISPLAY_COLORS[p.group], edgecolor="#111111",
+                linewidth=1.2, alpha=0.82,
+            )
+        )
+        if p.s >= 2:
+            ax.text(
+                p.x + (p.s - 1) / 2, p.y + (p.s - 1) / 2, str(p.s),
+                ha="center", va="center", fontsize=8 + p.s,
+                color="white", fontweight="bold",
+            )
+
+    ax.set_title(
+        f"blue = structure   red = monster   green = extra {fs}x{fs}\n"
+        f"extra {fs}x{fs}: {sol['fill_count']}  (upper bound {sol['fill_upper_bound']})",
+        pad=16,
+    )
+    ax.set_xlim(-0.5, W - 0.5)
+    ax.set_ylim(H - 0.5, -0.5)
+    ax.set_xticks(np.arange(-0.5, W, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, H, 1), minor=True)
+    ax.grid(which="minor", color="#DDDDDD", linewidth=0.35)
+    ax.tick_params(which="both", bottom=False, left=False, labelbottom=False, labelleft=False)
+    ax.legend(
+        handles=[mpatches.Patch(color=DISPLAY_COLORS[g], label=g.capitalize())
+                 for g in ("structure", "monster", "extra", "blocked")],
+        loc="upper center", bbox_to_anchor=(0.5, -0.04), ncol=4, frameon=False,
+    )
+    if show:
+        plt.tight_layout()
+        plt.show()
+    return ax
+
+
+_EXCEL_COLORS = {
+    ("blocked", -1): "FF2B2B2B", ("empty", 0): "FFFFFFFF",
+    ("structure", 1): "FFDCE8F5", ("structure", 2): "FFA9C4E2",
+    ("structure", 3): "FF6F9FD1", ("structure", 4): "FF3E79B2",
+    ("monster", 1): "FFF8D6D6", ("monster", 2): "FFF2A7A7",
+    ("monster", 3): "FFE46F6F", ("monster", 4): "FFD64545",
+    ("extra", 1): "FFD9F0D2", ("extra", 2): "FFA9D99B",
+    ("extra", 3): "FF78C266", ("extra", 4): "FF4AA64A",
+}
+
+
+def export_solution_to_excel(avail: np.ndarray, sol: dict, out_path: str = "solution.xlsx") -> str:
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise ImportError("openpyxl is required for the Excel export: pip install openpyxl") from exc
+
+    H, W = avail.shape
+    size_layer = np.where(avail, 0, -1).astype(int)
+    group_layer = np.where(avail, "empty", "blocked").astype(object)
+    for p in sol["placements"]:
+        size_layer[p.y : p.y + p.s, p.x : p.x + p.s] = p.s
+        group_layer[p.y : p.y + p.s, p.x : p.x + p.s] = p.group
+
+    # One PatternFill per distinct colour instead of one per cell.
+    fills = {key: PatternFill(start_color=c, end_color=c, fill_type="solid")
+             for key, c in _EXCEL_COLORS.items()}
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "solution"
+    for y in range(H):
+        ws.row_dimensions[y + 1].height = 18
+        for x in range(W):
+            ws.cell(row=y + 1, column=x + 1).fill = fills[(group_layer[y, x], int(size_layer[y, x]))]
+    for x in range(W):
+        ws.column_dimensions[get_column_letter(x + 1)].width = 4
+    wb.save(out_path)
+    return out_path
