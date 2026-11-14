@@ -220,13 +220,17 @@ def auto_workers() -> int:
     these models, and hyper-threads (two threads sharing one core) only slow
     each strategy down. Without psutil the logical CPU count is used.
     """
+    return max(1, min(AUTO_MAX_WORKERS, physical_cores()))
+
+
+def physical_cores() -> int:
+    """Physical CPU cores (psutil), or logical CPUs if psutil is missing."""
     try:
         import psutil
         cores = psutil.cpu_count(logical=False)
     except Exception:  # psutil missing or unsupported here
         cores = None
-    cores = cores or os.cpu_count() or 1
-    return max(1, min(AUTO_MAX_WORKERS, cores))
+    return cores or os.cpu_count() or 1
 
 
 def _pack_workers(workers: int) -> int:

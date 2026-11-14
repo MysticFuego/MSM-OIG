@@ -3,6 +3,8 @@ Checks for the msm package on a small made-up island (fast).
 Run from the project folder:   python -m unittest -v
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -213,6 +215,36 @@ class MsmTests(unittest.TestCase):
         problems = " ".join(msm.check(layout))
         self.assertIn("covered twice", problems)
         self.assertIn("expected", problems)
+
+    def test_excel_open_elsewhere_saves_a_copy(self):
+        from unittest import mock
+        from openpyxl import Workbook
+        layout = self.solve()
+        path = os.path.join(self.tmp.name, "locked.xlsx")
+        real = Workbook.save
+
+        def save(wb, filename):
+            if filename == path:  # as if Excel had it open
+                raise PermissionError(13, "Permission denied", filename)
+            return real(wb, filename)
+        with mock.patch.object(Workbook, "save", save):
+            with self.assertWarnsRegex(UserWarning, "open in another program"):
+                saved = msm.export_excel(layout, path)
+        self.assertEqual(os.path.basename(saved), "locked (1).xlsx")
+        self.assertTrue(os.path.exists(saved))
+
+    def test_run_all_in_parallel_keeps_order_and_failures(self):
+        islands = {"A": {"csv": self.csv, "structures": {3: 2}, "monsters": {2: 2}},
+                   "Broken": {"csv": self.csv, "monstres": {}},
+                   "B": {"csv": self.csv, "structures": {2: 2, 1: 2}, "monsters": {1: 3}}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = msm.run_all(islands, out_dir=self.tmp.name, parallel=2, workers=2,
+                                  time_limit=None, arrange_time_limit=5)
+        self.assertEqual(list(results), ["A", "Broken", "B"])
+        self.assertIsInstance(results["A"], msm.Layout)
+        self.assertIsInstance(results["B"], msm.Layout)
+        self.assertIn("unknown setting", results["Broken"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "A.xlsx")))
 
     def test_excel_export(self):
         layout = self.solve()

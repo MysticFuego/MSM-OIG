@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import warnings
+
 import numpy as np
 
 from .grid import cell_name, square
@@ -163,8 +166,26 @@ def export_excel(layout: Layout, path: str | None = None) -> str:
     s.column_dimensions["B"].width = 60
     for r in range(1, s.max_row + 1):
         s.cell(r, 1).font = Font(bold=True)
-    wb.save(path)
-    return path
+    return _save(wb, path)
+
+
+def _save(wb, path: str) -> str:
+    """
+    Save the workbook. If the file is open in Excel (Windows locks it), save
+    next to it as "<name> (1).xlsx", "(2)", ... instead of losing the result.
+    """
+    root, ext = os.path.splitext(path)
+    for n in range(0, 100):
+        target = path if n == 0 else f"{root} ({n}){ext}"
+        try:
+            wb.save(target)
+        except PermissionError:
+            continue
+        if n:
+            warnings.warn(f"{os.path.basename(path)} is open in another program (close it in Excel);"
+                          f" saved as {os.path.basename(target)} instead.", stacklevel=3)
+        return target
+    raise PermissionError(f"could not save {path}: it and 99 numbered copies are all in use or read-only.")
 
 
 def _summary_rows(layout: Layout) -> list[tuple]:

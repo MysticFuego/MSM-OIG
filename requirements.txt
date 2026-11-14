@@ -1,0 +1,6 @@
+# Install with:  py -m pip install -r requirements.txt   (Mac/Linux: python3 -m pip ...)
+ortools>=9.10       # CP-SAT solver
+numpy>=1.24
+matplotlib>=3.7     # msm.draw
+openpyxl>=3.1       # Excel output
+psutil>=5.9         # counts physical cores to pick the number of workers (optional)
