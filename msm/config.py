@@ -6,6 +6,7 @@ Island settings, as written in the notebook's ISLANDS cell.
         "excel": "Plant.xlsx",            # output file (default: <name>.xlsx)
         "structures": {4: 3, 3: 8, 1: 10},   # count by size, or named (see below)
         "monsters": {4: 3, 3: 3, 2: 52, 1: 23},  # your collection, by size
+        "trios": {4: 1, 3: 1, 2: 14, 1: 3},   # of those, groups of 3 identical monsters kept side by side
         "beds": 36,                       # income mode: extras use exactly this many beds
         "catalog": [ {extra}, ... ],      # income mode: optional extras (see Extra)
         "fill": 2,                        # fill mode only: size of the fill squares
@@ -64,6 +65,7 @@ class Island:
     fill: int = 2
     locked: list = field(default_factory=list)
     flip_up: bool = False
+    trios: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "Island":
@@ -122,6 +124,13 @@ class Island:
                                   beds=beds, min=lo, max=hi, back=bool(e.get("back", True))))
         else:
             kinds.append(Kind(f"fill {self.fill}x{self.fill}", "fill", _size(self.fill, "fill")))
+
+        for s, n in self.trios.items():
+            s, n = _size(s, "trios"), _count(n, "trios")
+            have = sum(k.count for k in kinds if k.group == "collection" and k.size == s)
+            if 3 * n > have:
+                raise ValueError(f"{self.name}: {n} trios of {s}x{s} need {3 * n} monsters of that size,"
+                                 f" but 'monsters' has {have}.")
 
         names = [k.name for k in kinds]
         dupes = {n for n in names if names.count(n) > 1}

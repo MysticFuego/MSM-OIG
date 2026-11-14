@@ -216,6 +216,60 @@ class MsmTests(unittest.TestCase):
         self.assertIn("covered twice", problems)
         self.assertIn("expected", problems)
 
+    # ---- trios: 3 identical monsters side by side ------------------------- #
+    def test_trios_labelled_with_swaps(self):
+        # collection A sits apart; B and C touch, and so does extra D: the trio
+        # becomes B, C, D's spot, and D moves to A's spot (positions unchanged)
+        from msm.grid import Height
+        from msm.solver import Placement, _finish_trios
+        grid = load_grid(self.csv)
+        height = Height(grid, find_axis(grid))
+        a, b, c = (Placement(x, y, 2, "collection 2x2", "collection") for x, y in ((9, 0), (4, 4), (6, 4)))
+        d = Placement(8, 4, 2, "Big", "extra")
+        placed, result = _finish_trios([a, b, c, d], {2: 1}, height, workers=2, back={"Big"})
+        self.assertEqual(result, {2: (1, 1)})
+        self.assertEqual({(p.x, p.y) for p in placed}, {(9, 0), (4, 4), (6, 4), (8, 4)})
+        trio = {(p.x, p.y) for p in placed if p.trio == 1}
+        self.assertEqual(trio, {(4, 4), (6, 4), (8, 4)})
+        self.assertTrue(all(p.kind == "collection 2x2" for p in placed if p.trio))
+        self.assertEqual([p.kind for p in placed if (p.x, p.y) == (9, 0)], ["Big"])
+
+    def test_trio_gap_allows_close_but_prefers_touching(self):
+        from msm.grid import Height
+        from msm.solver import Placement, _finish_trios
+        grid = load_grid(self.csv)
+        height = Height(grid, find_axis(grid))
+        spaced = [Placement(x, 5, 1, "collection 1x1", "collection") for x in (2, 4, 6)]  # 1 tile apart
+        self.assertEqual(_finish_trios(spaced, {1: 1}, height, 2, gap=0)[1], {1: (0, 1)})
+        self.assertEqual(_finish_trios(spaced, {1: 1}, height, 2, gap=1)[1], {1: (1, 1)})
+        # a touching trio (with a swap) beats a spaced one (without)
+        coll = [Placement(x, 0, 2, "collection 2x2", "collection") for x in (0, 3, 6)]
+        extra = [Placement(x, 2, 2, "Big", "extra") for x in (0, 2)]  # (0,0), (0,2), (2,2) touch
+        placed, _ = _finish_trios(coll + extra, {2: 1}, height, 2, back={"Big"}, gap=1)
+        trio = sorted((p.x, p.y) for p in placed if p.trio)
+        self.assertEqual(trio, [(0, 0), (0, 2), (2, 2)])
+
+    def test_trios_in_a_full_solve(self):
+        catalog = [{"name": "Big", "size": 2, "income": 10}]
+        layout = self.solve(catalog=catalog, beds=2, structures={1: 2}, monsters={3: 3, 2: 6, 1: 3},
+                            trios={3: 1, 2: 2, 1: 1})
+        plain = self.solve(catalog=catalog, beds=2, structures={1: 2}, monsters={3: 3, 2: 6, 1: 3})
+        self.assertEqual((layout.income, layout.mix), (plain.income, plain.mix))  # never costs income
+        self.assertEqual({s: w for s, (f, w) in layout.trios.items()}, {3: 1, 2: 2, 1: 1})
+        for s, (formed, _) in layout.trios.items():
+            self.assertEqual(formed, len({p.trio for p in layout.placements if p.trio and p.s == s}))
+        # check() (run by self.solve) verifies trios; a moved member must be caught
+        if any(p.trio for p in layout.placements):
+            bad = list(layout.placements)
+            i = next(i for i, p in enumerate(bad) if p.trio)
+            bad[i] = msm.Placement(bad[i].x + 20, bad[i].y, bad[i].s, bad[i].kind, bad[i].group, False, bad[i].trio)
+            broken = msm.Layout(**{**layout.__dict__, "placements": bad})
+            self.assertTrue(any(f"trio {bad[i].trio}" in problem for problem in msm.check(broken)))
+
+    def test_too_many_trios_rejected(self):
+        with self.assertRaisesRegex(ValueError, "trios of 2x2 need 6"):
+            self.solve(monsters={2: 4}, trios={2: 2})
+
     def test_excel_open_elsewhere_saves_a_copy(self):
         from unittest import mock
         from openpyxl import Workbook

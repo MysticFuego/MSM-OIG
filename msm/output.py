@@ -60,7 +60,10 @@ def draw(layout: Layout, ax=None, show: bool = True):
                                         edgecolor="#111111", linewidth=2.6 if p.locked else 1.2,
                                         hatch="///" if p.locked else None))
         name = _label(p)
-        if p.s >= 2 or name:
+        if p.trio:  # one of 3 identical monsters kept together: "T<n>"
+            ax.text(p.x + (p.s - 1) / 2, p.y + (p.s - 1) / 2, f"T{p.trio}", ha="center", va="center",
+                    fontsize=5 + 2 * p.s if p.s > 1 else 6, color="white", fontweight="bold")
+        elif p.s >= 2 or name:
             text = f"{p.s}" if not name or p.s < 3 else f"{p.s}\n{name[:9]}"
             ax.text(p.x + (p.s - 1) / 2, p.y + (p.s - 1) / 2, text, ha="center", va="center",
                     fontsize=7 + p.s, color="white", fontweight="bold")
@@ -143,6 +146,8 @@ def export_excel(layout: Layout, path: str | None = None) -> str:
         for cx, cy in square(p.x, p.y, p.s):
             ws.cell(cy + 1, cx + 1).fill = fill(hex6)
         name = _label(p)
+        if p.trio:  # one of 3 identical monsters kept together
+            name = f"T{p.trio}"
         if name or p.locked:
             c = ws.cell(p.y + 1, p.x + 1)
             c.value = (name or "") + (" (locked)" if p.locked else "")
@@ -208,6 +213,10 @@ def _summary_rows(layout: Layout) -> list[tuple]:
             rows.append(("Same type opposite", f"{layout.same_type}/{layout.structures_total}"))
     if layout.arrange_gap is not None:
         rows.append(("Arrangement", f"{layout.arrange_gap:.1%} from the solver's bound (cosmetic only)"))
+    if layout.trios:
+        close = "touching" if layout.trio_gap <= 0 else f"within {layout.trio_gap} tile{'s' * (layout.trio_gap > 1)}"
+        rows.append((f"Trios (T1, T2, ...; {close})",
+                     ", ".join(f"{s}x{s} {f}/{w}" for s, (f, w) in sorted(layout.trios.items(), reverse=True))))
     rows += [("Free tiles", layout.free_cells),
              ("Mirror axis", f"{layout.axis.kind} diagonal, {layout.axis.matched}/{layout.axis.total} tiles mirror"),
              ("In-game top tile", cell_name(*layout.height.top_cell(layout.grid)))]

@@ -25,7 +25,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 import numpy as np
@@ -64,6 +64,7 @@ class Placement:
     kind: str
     group: str
     locked: bool = False
+    trio: int = 0        # collection monsters: number of its group of 3 identical ones (0 = none)
 
 
 @dataclass
@@ -84,6 +85,8 @@ class Layout:
     mirrored_bound: int | None = None
     symmetry_optimal: bool = False
     arrange_gap: float | None = None   # distance from the best arrangement
+    trios: dict = field(default_factory=dict)  # size -> (trios kept together, trios wanted)
+    trio_gap: int = 0                  # tiles allowed between members of a trio
     seconds: dict = field(default_factory=dict)
 
     @property
@@ -105,16 +108,20 @@ class Layout:
 
 # --------------------------------------------------------------------------- #
 def solve(island: Island, *, time_limit: float | None = None, arrange_time_limit: float | None = 120,
-          symmetry: bool = True, workers: int | None = None, log: bool = False) -> Layout:
+          symmetry: bool = True, workers: int | None = None, trio_gap: int = 1,
+          log: bool = False) -> Layout:
     """
     Solve one island. time_limit=None runs packing and symmetry until proven
     best; arrange_time_limit caps only the cosmetic last step. workers=None
     picks the number for this computer (see auto_workers); a number overrides it.
+    trio_gap: how many tiles may separate the members of a trio (0 = touching).
     Raises ValueError for bad settings and RuntimeError if nothing fits.
     """
     for label, t in (("time_limit", time_limit), ("arrange_time_limit", arrange_time_limit)):
         if t is not None and t <= 0:
             raise ValueError(f"{label} must be more than 0 seconds, or None for no limit; got {t}.")
+    if int(trio_gap) < 0:
+        raise ValueError(f"trio_gap must be 0 or more tiles; got {trio_gap}.")
     if workers is None:
         workers = auto_workers()
     elif int(workers) < 1:
@@ -176,24 +183,25 @@ def solve(island: Island, *, time_limit: float | None = None, arrange_time_limit
     # ---- 3. arrange ------------------------------------------------------- #
     behind = sum(k.size ** 2 * k.count for k in kinds if k.back)
     front = height.depth_after(grid, behind)
-    m, v = _kind_model(grid, skinds, spools, slocks)
-    if out.mirrored:
-        m.Add(sum(_mirror_terms(m, v, structures, axis, hint=layout)) >= out.mirrored)
-    by_name = {k.name: k for k in skinds}
-    m.Maximize(sum(_preference(by_name[name], height, front, x, y) * var
-                   for name, vm in v.items() for (x, y), var in vm.items()))
-    _hint(m, v, layout)
     limit = left()
     if arrange_time_limit:
         limit = arrange_time_limit if limit is None else min(limit, arrange_time_limit)
-    solver, status, secs = _run(m, limit, workers, gap=ARRANGE_GAP, patience=ARRANGE_PATIENCE,
-                                min_gain=ARRANGE_MIN_GAIN)
-    out.seconds["arrange"] = secs
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        layout = _extract(solver, v, skinds, slocks)
-        obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
-        out.arrange_gap = max(0.0, (bound - obj) / max(1.0, abs(obj)))
-    say(f"arranged ({out.arrange_gap or 0:.1%} from the solver's bound) | {secs:.1f}s")
+    t_arr = time.time()
+    res = _arrange(grid, height, front, skinds, spools, slocks, structures, axis, out.mirrored, layout,
+                   limit, workers)
+    out.seconds["arrange"] = time.time() - t_arr
+    if res is not None:
+        layout, out.arrange_gap = res
+    say(f"arranged ({out.arrange_gap or 0:.1%} from the solver's bound) | {out.seconds['arrange']:.1f}s")
+
+    # trios: label groups of 3 touching collection monsters (positions never move)
+    wanted = {int(s): int(n) for s, n in island.trios.items() if int(n) > 0}
+    if wanted:
+        out.trio_gap = int(trio_gap)
+        layout, out.trios = _finish_trios(layout, wanted, height, workers, back={k.name for k in kinds if k.back},
+                                          gap=out.trio_gap)
+        say("trios kept together: " + ", ".join(f"{s}x{s} {f}/{w}" for s, (f, w) in sorted(out.trios.items(),
+                                                                                       reverse=True)))
 
     layout, out.same_type = _name_structures(layout, kinds, locks, axis, workers)
     out.placements = layout
@@ -691,8 +699,9 @@ class _Progress(cp_model.CpSolverSolutionCallback):
 
 def _run(m, time_limit, workers, gap=None, patience=None, min_gain=0.0, on_improve=None):
     """
-    Solve a (maximisation) model. patience: stop once the objective has not
-    improved by min_gain for that many seconds. on_improve(obj, bound, secs)
+    Solve a (maximisation) model. patience: once a solution exists, stop when
+    the objective has not improved by min_gain for that many seconds (before
+    the first solution only time_limit applies). on_improve(obj, bound, secs)
     is called on every improvement.
     """
     solver = cp_model.CpSolver()
@@ -709,7 +718,7 @@ def _run(m, time_limit, workers, gap=None, patience=None, min_gain=0.0, on_impro
 
     def watchdog():
         while not done.wait(0.25):
-            if time.time() - watch.last > patience:
+            if watch.best is not None and time.time() - watch.last > patience:
                 solver.StopSearch()
                 return
 
@@ -720,6 +729,126 @@ def _run(m, time_limit, workers, gap=None, patience=None, min_gain=0.0, on_impro
     finally:
         done.set()
     return solver, status, solver.WallTime()
+
+
+# --------------------------------------------------------------------------- #
+# 3. arrange
+# --------------------------------------------------------------------------- #
+def _arrange(grid, height, front, skinds, spools, slocks, structures, axis, mirrored, layout, limit, workers):
+    """The arrange model (counts and mirrored structures kept). Returns (placements, gap) or None."""
+    m, v = _kind_model(grid, skinds, spools, slocks)
+    if mirrored:
+        m.Add(sum(_mirror_terms(m, v, structures, axis, hint=layout)) >= mirrored)
+    by_name = {k.name: k for k in skinds}
+    m.Maximize(sum(_preference(by_name[name], height, front, x, y) * var
+                   for name, vm in v.items() for (x, y), var in vm.items()))
+    _hint(m, v, layout)
+    solver, status, _ = _run(m, limit, workers, gap=ARRANGE_GAP, patience=ARRANGE_PATIENCE,
+                             min_gain=ARRANGE_MIN_GAIN)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+    obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
+    return _extract(solver, v, skinds, slocks), max(0.0, (bound - obj) / max(1.0, abs(obj)))
+
+
+# --------------------------------------------------------------------------- #
+# trios: groups of 3 identical collection monsters kept side by side
+# --------------------------------------------------------------------------- #
+def touching(a: Placement, b: Placement) -> bool:
+    """Two squares of the same size share part of an edge (corners don't count)."""
+    s, dx, dy = a.s, abs(a.x - b.x), abs(a.y - b.y)
+    return (dx == s and dy < s) or (dy == s and dx < s)
+
+
+def tiles_apart(a: Placement, b: Placement) -> int:
+    """Tiles between two same-size squares (0 = touching, at an edge or a corner)."""
+    return max(0, abs(a.x - b.x) - a.s, abs(a.y - b.y) - a.s)
+
+
+def close(a: Placement, b: Placement, gap: int) -> bool:
+    """Close enough to be in one trio: touching, or at most `gap` tiles apart."""
+    return touching(a, b) if gap <= 0 else tiles_apart(a, b) <= gap
+
+
+def _choose_trios(pieces, want, preferred=None, workers=8, gap=0):
+    """
+    Up to `want` disjoint groups of 3 close squares among `pieces` (same size;
+    one square of each group is close to the other two: touching, or at most
+    `gap` tiles apart). preferred[i]: use piece i if possible (fewer swaps).
+    Returns groups as tuples of indices.
+    """
+    if want <= 0:
+        return []
+    n = len(pieces)
+    near = {i: [j for j in range(n) if j != i and close(pieces[i], pieces[j], gap)] for i in range(n)}
+    triples = {tuple(sorted((a, b, c))) for c in range(n) for a_i, a in enumerate(near[c]) for b in near[c][a_i + 1:]}
+    if not triples:
+        return []
+    preferred = preferred or [True] * n
+    m = cp_model.CpModel()
+    t = {tr: m.NewBoolVar("") for tr in triples}
+    uses = defaultdict(list)
+    for tr, var in t.items():
+        for i in tr:
+            uses[i].append(var)
+    for vs in uses.values():
+        m.AddAtMostOne(vs)
+    m.Add(sum(t.values()) <= want)
+
+    def score(tr):  # most trios; then ones that really touch (spacing only when needed); fewest swaps; tightest
+        pairs = ((tr[0], tr[1]), (tr[0], tr[2]), (tr[1], tr[2]))
+        touch = sum(touching(pieces[a], pieces[b]) for a, b in pairs) >= 2
+        tight = sum(3 if touching(pieces[a], pieces[b]) else max(0, 2 - tiles_apart(pieces[a], pieces[b]))
+                    for a, b in pairs)
+        return 1_000_000 + 10_000 * touch + 100 * sum(preferred[i] for i in tr) + tight
+    m.Maximize(sum(score(tr) * var for tr, var in t.items()))
+    solver, status, _ = _run(m, 30, workers)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return []
+    return [tr for tr, var in t.items() if solver.Value(var)]
+
+
+def _finish_trios(layout, wanted, height, workers, back=frozenset(), gap=0):
+    """
+    Label the trios: among the unlocked
+    non-structure squares of that size, pick close groups of 3 (see close) and put
+    collection monsters there, swapping with same-size extras / fill if
+    needed (positions never change, so income and symmetry are untouched).
+    Then number every trio 1, 2, ... biggest size first, back to front.
+    back: names of back-pulled kinds. Returns (placements, {size: (kept together, wanted)}).
+    """
+    layout = list(layout)
+    result = {}
+    for s, want in wanted.items():
+        idx = [i for i, p in enumerate(layout) if p.s == s and p.group != "structure" and not p.locked]
+        coll = [i for i in idx if layout[i].group == "collection"]
+        want = min(want, len(coll) // 3)
+        pieces = [layout[i] for i in idx]
+        groups = _choose_trios(pieces, want, [p.group == "collection" for p in pieces], workers, gap)
+        in_trio = {idx[j]: g for g, tr in enumerate(groups) for j in tr}
+        displaced = [layout[i] for i in in_trio if layout[i].group != "collection"]
+        free_coll = sorted((i for i in coll if i not in in_trio), key=lambda i: height.depth2(layout[i].x, layout[i].y, s))
+        coll_kind = layout[coll[0]].kind if coll else f"collection {s}x{s}"
+        # displaced pieces take former collection spots: back-pulled ones the furthest back
+        back_first = [p for p in displaced if p.kind in back]
+        others = [p for p in displaced if p.kind not in back]
+        for p, i in zip(back_first, free_coll):
+            layout[i] = replace(layout[i], kind=p.kind, group=p.group)
+        for p, i in zip(others, reversed(free_coll[len(back_first):])):
+            layout[i] = replace(layout[i], kind=p.kind, group=p.group)
+        for i, g in in_trio.items():
+            layout[i] = replace(layout[i], kind=coll_kind, group="collection", trio=-(1000 * s + g + 1))
+        result[s] = (len(groups), wanted[s])
+    # final numbers
+    tags = defaultdict(list)
+    for i, p in enumerate(layout):
+        if p.trio:
+            tags[p.trio].append(i)
+    order = sorted(tags, key=lambda t: (-layout[tags[t][0]].s,
+                                        min(height.depth2(layout[i].x, layout[i].y, layout[i].s) for i in tags[t])))
+    number = {t: n + 1 for n, t in enumerate(order)}
+    layout = [replace(p, trio=number[p.trio]) if p.trio else p for p in layout]
+    return layout, result
 
 
 # --------------------------------------------------------------------------- #
@@ -778,6 +907,15 @@ def check(layout: Layout) -> list[str]:
             problems.append(f"{k.name}: {count[k.name]} placed, expected {k.count}")
         if k.group == "extra" and not k.min <= k.count <= k.max:
             problems.append(f"{k.name}: {k.count} placed, allowed {k.min}-{k.max}")
+    groups = defaultdict(list)
+    for p in layout.placements:
+        if p.trio:
+            groups[p.trio].append(p)
+    for t, ps in groups.items():
+        ok = len(ps) == 3 and len({p.s for p in ps}) == 1 and all(p.group == "collection" for p in ps)
+        linked = sum(close(a, b, layout.trio_gap) for a, b in ((ps[0], ps[1]), (ps[0], ps[2]), (ps[1], ps[2])))
+        if not ok or linked < 2:  # 3 squares are connected when at least 2 of the pairs are close
+            problems.append(f"trio {t} is not 3 close collection monsters of one size")
     isl = layout.island
     if isl.income_mode and isl.beds is not None and layout.beds_used != int(isl.beds):
         problems.append(f"extras use {layout.beds_used} beds, expected exactly {isl.beds}")
