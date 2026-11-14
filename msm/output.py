@@ -186,7 +186,7 @@ def _summary_rows(layout: Layout) -> list[tuple]:
         if _named(layout):
             rows.append(("Same type opposite", f"{layout.same_type}/{layout.structures_total}"))
     if layout.arrange_gap is not None:
-        rows.append(("Arrangement", f"within {layout.arrange_gap:.1%} of best"))
+        rows.append(("Arrangement", f"{layout.arrange_gap:.1%} from the solver's bound (cosmetic only)"))
     rows += [("Free tiles", layout.free_cells),
              ("Mirror axis", f"{layout.axis.kind} diagonal, {layout.axis.matched}/{layout.axis.total} tiles mirror"),
              ("In-game top tile", cell_name(*layout.height.top_cell(layout.grid)))]

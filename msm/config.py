@@ -23,6 +23,7 @@ the same type opposite itself wherever possible:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 from .grid import parse_cell
@@ -37,7 +38,7 @@ class Kind:
     group: str        # "structure" | "collection" | "extra" | "fill"
     size: int
     count: int = 0    # how many to place (extras/fill: decided by the solver)
-    income: int = 0   # extras only
+    income: float = 0  # extras only (any unit; decimals are kept exactly)
     beds: int = 0
     min: int = 0
     max: int = 0
@@ -91,16 +92,23 @@ class Island:
         if isinstance(self.structures, dict):
             items = [(f"structure {s}x{s}", s, n) for s, n in self.structures.items()]
         else:
-            items = [tuple(t) if not isinstance(t, dict) else (t["name"], t["size"], t.get("count", 1))
-                     for t in self.structures]
+            items = [self._structure_item(t) for t in self.structures]
         for name, s, n in items:
             kinds.append(Kind(str(name), "structure", _size(s, name), _count(n, name), back=True))
 
         for s, n in self.monsters.items():
             kinds.append(Kind(f"collection {s}x{s}", "collection", _size(s, "monsters"), _count(n, "monsters")))
 
+        if self.beds is not None and not self.catalog:
+            warnings.warn(f"{self.name}: 'beds' is ignored without a 'catalog' (fill mode).", stacklevel=3)
         if self.catalog:
             for e in self.catalog:
+                if not isinstance(e, dict) or "name" not in e or "size" not in e:
+                    raise ValueError(f"{self.name}: catalog entry {e!r} needs at least 'name' and 'size'.")
+                unknown = set(e) - _EXTRA_KEYS
+                if unknown:
+                    raise ValueError(f"{self.name}: catalog entry {e['name']!r} has unknown key(s) {sorted(unknown)};"
+                                     f" allowed: {sorted(_EXTRA_KEYS)}.")
                 name, s = str(e["name"]), _size(e["size"], e["name"])
                 lo = _count(e.get("min", 0), name)
                 hi = e.get("max")
@@ -110,7 +118,7 @@ class Island:
                     hi = min(hi, self.beds // beds)
                 if hi < lo:
                     raise ValueError(f"{self.name}: {name} needs min {lo} but at most {hi} fit the limits/beds.")
-                kinds.append(Kind(name, "extra", s, income=int(round(float(e.get("income", 0)))),
+                kinds.append(Kind(name, "extra", s, income=_number(e.get("income", 0), name),
                                   beds=beds, min=lo, max=hi, back=bool(e.get("back", True))))
         else:
             kinds.append(Kind(f"fill {self.fill}x{self.fill}", "fill", _size(self.fill, "fill")))
@@ -130,16 +138,63 @@ class Island:
         by_name = {k.name: k for k in kinds}
         out = []
         for d in self.locked:
+            if not isinstance(d, dict) or "what" not in d or "at" not in d:
+                raise ValueError(f"{self.name}: locked entry {d!r} needs 'what' and 'at',"
+                                 f" e.g. {{'what': 'Wubbox', 'at': 'R10'}}.")
+            unknown = set(d) - {"what", "at", "size"}
+            if unknown:
+                raise ValueError(f"{self.name}: locked entry {d!r} has unknown key(s) {sorted(unknown)}.")
+            if not isinstance(d["at"], str):
+                raise ValueError(f"{self.name}: locked {d['what']!r}: 'at' must be a cell name like 'N3', got {d['at']!r}.")
             what = str(d["what"])
             if what in ("structure", "collection"):
-                what = f"{what} {d['size']}x{d['size']}"
+                if "size" not in d:
+                    raise ValueError(f"{self.name}: locked {what!r} needs a 'size' (1-4).")
+                s = _size(d["size"], f"{self.name}: locked {what}")
+                what = f"{what} {s}x{s}"
+                if what not in by_name and what.startswith("structure "):
+                    # named structures: a size-only lock means the one type of that size
+                    named = [k.name for k in kinds if k.group == "structure" and k.size == s]
+                    if len(named) == 1:
+                        what = named[0]
+                    elif named:
+                        raise ValueError(f"{self.name}: several {s}x{s} structure types ({', '.join(named)});"
+                                         f" lock one by name, e.g. {{'what': {named[0]!r}, 'at': {d['at']!r}}}.")
             if what not in by_name:
-                raise ValueError(f"{self.name}: locked piece {d['what']!r} is not a structure, extra or collection size here.")
+                have = sorted(k.name for k in kinds if k.group in ("structure", "extra")) + \
+                    sorted({f"collection size {k.size}" for k in kinds if k.group == "collection"})
+                size = f" size {d['size']}" if "size" in d else ""
+                raise ValueError(f"{self.name}: locked piece {d['what']!r}{size} is not on this island."
+                                 f" Pieces here: {', '.join(have)}.")
             if "size" in d and int(d["size"]) != by_name[what].size:
                 raise ValueError(f"{self.name}: locked {what} is {by_name[what].size}x{by_name[what].size}, not size {d['size']}.")
             x, y = parse_cell(d["at"])
             out.append(Lock(what, x, y))
         return out
+
+    def _structure_item(self, t):
+        """("Castle", 4, 1), ("Castle", 4) or {"name": ..., "size": ..., "count": ...}."""
+        if isinstance(t, dict):
+            if "name" not in t or "size" not in t:
+                raise ValueError(f"{self.name}: structure {t!r} needs 'name' and 'size'.")
+            return t["name"], t["size"], t.get("count", 1)
+        t = tuple(t)
+        if len(t) == 2:
+            return t[0], t[1], 1
+        if len(t) != 3:
+            raise ValueError(f"{self.name}: structure {t!r} should be (name, size) or (name, size, count).")
+        return t
+
+
+_EXTRA_KEYS = {"name", "size", "income", "beds", "min", "max", "back"}
+
+
+def _number(x, label):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}: income must be a number, got {x!r}.") from None
+    return int(x) if x.is_integer() else x
 
 
 def _size(s, label) -> int:

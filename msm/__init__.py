@@ -33,7 +33,9 @@ def run_all(islands: dict, *, out_dir: str = ".", **solve_options) -> dict:
         try:
             island = Island.from_dict(name, settings)
             layout = solve(island, **solve_options)
-            export_excel(layout, os.path.join(out_dir, os.path.basename(island.excel_path)))
+            path = os.path.join(out_dir, island.excel_path)  # an absolute "excel" path wins
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            export_excel(layout, path)
             results[name] = layout
         except Exception as exc:  # keep going; report it in the table
             results[name] = f"{type(exc).__name__}: {exc}"

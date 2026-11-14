@@ -117,6 +117,103 @@ class MsmTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "open tiles"):
             self.solve(locked=[{"what": "structure", "size": 3, "at": "A1"}])  # A1 is blocked
 
+    # ---- regressions for fixed bugs ------------------------------------- #
+    def test_symmetry_uses_spots_outside_the_back_band(self):
+        # With an empty back band, symmetry used to depend on where step 1
+        # happened to put the structures, and a worse result could still be
+        # reported as "proven best". Every spot is now considered.
+        from unittest import mock
+        with mock.patch.object(msm.solver, "STRUCTURE_BAND", {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}):
+            for structures in ({4: 1, 2: 2}, {3: 3, 2: 2, 1: 1}):
+                layout = self.solve(structures=structures, monsters={1: 2})
+                self.assertEqual(layout.mirrored, layout.structures_total)
+                self.assertTrue(layout.symmetry_optimal)
+
+    def test_reported_mirrored_matches_final_layout(self):
+        layout = self.solve(structures={3: 3, 2: 2, 1: 3})
+        self.assertEqual(layout.mirrored, msm.solver.count_mirrored(layout.placements, layout.axis))
+        self.assertLessEqual(layout.same_type, layout.mirrored)
+
+    def test_fractional_incomes_are_exact(self):
+        catalog = [{"name": "A", "size": 1, "income": 3.4, "beds": 2},
+                   {"name": "B", "size": 1, "income": 1.6, "beds": 1}]
+        layout = self.solve(catalog=catalog, beds=2)  # rounded, 2xB (2+2) beat A (3)
+        self.assertEqual(layout.mix, {"A": 1, "B": 0})
+        self.assertAlmostEqual(layout.income, 3.4)
+
+    def test_timeout_is_not_reported_as_impossible(self):
+        from unittest import mock
+        from ortools.sat.python import cp_model
+        real = msm.solver._run
+
+        def no_time(m, *a, **k):
+            solver, _, secs = real(m, *a, **k)
+            return solver, cp_model.UNKNOWN, secs
+        with mock.patch.object(msm.solver, "_run", no_time):
+            with self.assertRaisesRegex(RuntimeError, "ran out of time"):
+                self.solve()
+
+    def test_zero_time_limit_rejected(self):
+        with self.assertRaisesRegex(ValueError, "time_limit"):
+            msm.solve(self.island(), time_limit=0)
+
+    def test_workers_picked_for_this_computer(self):
+        n = msm.solver.auto_workers()
+        self.assertTrue(1 <= n <= msm.solver.AUTO_MAX_WORKERS)
+        self.assertLessEqual(n, os.cpu_count() or 1)
+        layout = msm.solve(self.island(), time_limit=None, arrange_time_limit=5)  # workers=None
+        self.assertEqual(msm.check(layout), [])
+        with self.assertRaisesRegex(ValueError, "workers"):
+            msm.solve(self.island(), workers=0)
+
+    def test_blank_rows_in_csv_are_kept(self):
+        path = os.path.join(self.tmp.name, "blank.csv")
+        with open(path, "w") as f:
+            f.write(".,.,.\n,,\n.,,.\n\n")
+        self.assertEqual(load_grid(path).shape, (3, 3))  # middle row blocked, trailing blank line dropped
+        with open(path, "w") as f:
+            f.write("#,#\n#,#\n")
+        with self.assertRaisesRegex(ValueError, "no open tiles"):
+            load_grid(path)
+
+    def test_size_lock_with_named_structures(self):
+        named = [("Castle", 3, 1), ("Shop", 3, 1), ("Statue", 1, 2)]
+        layout = self.solve(structures=[("Castle", 3, 2), ("Statue", 1)],
+                            locked=[{"what": "structure", "size": 3, "at": "E5"}])
+        self.assertIn(("Castle", 4, 4), {(p.kind, p.x, p.y) for p in layout.placements if p.locked})
+        with self.assertRaisesRegex(ValueError, "lock one by name"):
+            self.solve(structures=named, locked=[{"what": "structure", "size": 3, "at": "E5"}])
+
+    def test_unclear_settings_give_clear_errors(self):
+        with self.assertRaisesRegex(ValueError, "needs 'what' and 'at'"):
+            self.solve(locked=[{"what": "collection", "size": 1}])
+        with self.assertRaisesRegex(ValueError, "needs a 'size'"):
+            self.solve(locked=[{"what": "structure", "at": "E5"}])
+        with self.assertRaisesRegex(ValueError, "cell name"):
+            self.solve(locked=[{"what": "structure", "size": 3, "at": (4, 4)}])
+        with self.assertRaisesRegex(ValueError, "unknown key"):
+            self.solve(catalog=[{"name": "Big", "size": 2, "incom": 10}], beds=2)
+        with self.assertWarnsRegex(UserWarning, "ignored"):
+            self.solve(beds=3)
+
+    def test_main_diagonal_island(self):
+        path = os.path.join(self.tmp.name, "main.csv")
+        with open(path, "w") as f:  # symmetric across x = y only
+            for y in range(12):
+                f.write(",".join("." if abs(x - y) <= 4 and 2 <= x + y <= 15 else "#" for x in range(12)) + "\n")
+        axis = find_axis(load_grid(path))
+        self.assertEqual((axis.kind, axis.c), ("main", 0))
+        layout = self.solve(csv=path, structures={2: 2, 1: 2}, monsters={2: 2, 1: 2})
+        self.assertEqual(layout.mirrored, 4)
+
+    def test_check_catches_broken_layouts(self):
+        layout = self.solve()
+        p = layout.placements[0]
+        layout.placements.append(p)  # same piece twice: overlap and a wrong count
+        problems = " ".join(msm.check(layout))
+        self.assertIn("covered twice", problems)
+        self.assertIn("expected", problems)
+
     def test_excel_export(self):
         layout = self.solve()
         path = msm.export_excel(layout, os.path.join(self.tmp.name, "out.xlsx"))

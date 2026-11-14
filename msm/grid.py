@@ -28,7 +28,11 @@ def load_grid(path: str) -> np.ndarray:
     """Read a CSV mask ('.' open, '#' blocked). Returns a bool array, True = open."""
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         rows = [[v.strip() for v in r] for r in csv.reader(f)]
-    rows = [r for r in rows if any(r)]
+    # Drop only trailing blank lines. A blank row in the middle is a fully
+    # blocked row (Excel saves those as ",,,"); removing it would shift every
+    # row below it, and with them the mirror axis and the locked cells.
+    while rows and not any(rows[-1]):
+        rows.pop()
     if not rows:
         raise ValueError(f"{path}: CSV is empty.")
     grid = np.zeros((len(rows), max(len(r) for r in rows)), dtype=bool)
@@ -40,6 +44,8 @@ def load_grid(path: str) -> np.ndarray:
             elif v not in _BLOCKED:
                 raise ValueError(f"{path}: unrecognised cell {value!r} at row {y + 1}, column {x + 1}. "
                                  f"Use '.' for open and '#' for blocked.")
+    if not grid.any():
+        raise ValueError(f"{path}: no open tiles ('.') in the CSV.")
     return grid
 
 
