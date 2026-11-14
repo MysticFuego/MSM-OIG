@@ -175,7 +175,10 @@ class Island:
                 size = f" size {d['size']}" if "size" in d else ""
                 raise ValueError(f"{self.name}: locked piece {d['what']!r}{size} is not on this island."
                                  f" Pieces here: {', '.join(have)}.")
-            if "size" in d and int(d["size"]) != by_name[what].size:
+            if by_name[what].group == "fill":
+                raise ValueError(f"{self.name}: fill squares can't be locked (the solver puts them wherever"
+                                 f" room is left); lock a structure, an extra or a collection monster instead.")
+            if "size" in d and _size(d["size"], f"{self.name}: locked {what}") != by_name[what].size:
                 raise ValueError(f"{self.name}: locked {what} is {by_name[what].size}x{by_name[what].size}, not size {d['size']}.")
             x, y = parse_cell(d["at"])
             out.append(Lock(what, x, y))
@@ -186,6 +189,10 @@ class Island:
         if isinstance(t, dict):
             if "name" not in t or "size" not in t:
                 raise ValueError(f"{self.name}: structure {t!r} needs 'name' and 'size'.")
+            unknown = set(t) - {"name", "size", "count"}
+            if unknown:
+                raise ValueError(f"{self.name}: structure {t['name']!r} has unknown key(s) {sorted(unknown)};"
+                                 f" allowed: count, name, size.")
             return t["name"], t["size"], t.get("count", 1)
         t = tuple(t)
         if len(t) == 2:
@@ -206,15 +213,28 @@ def _number(x, label):
     return int(x) if x.is_integer() else x
 
 
+def _whole(x):
+    """x as an int if it is a whole number (2, 2.0 or "2"; not 2.5, None or True), else None."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, str):
+        return int(x) if x.strip().isdigit() else None
+    try:
+        n = int(x)
+    except (TypeError, ValueError):
+        return None
+    return n if n == x else None
+
+
 def _size(s, label) -> int:
-    s = int(s)
-    if s not in SIZES:
-        raise ValueError(f"{label}: size must be 1-4, got {s}.")
-    return s
+    n = _whole(s)
+    if n not in SIZES:
+        raise ValueError(f"{label}: size must be 1-4, got {s!r}.")
+    return n
 
 
 def _count(n, label) -> int:
-    n = int(n)
-    if n < 0:
-        raise ValueError(f"{label}: counts must be >= 0, got {n}.")
-    return n
+    c = _whole(n)
+    if c is None or c < 0:
+        raise ValueError(f"{label}: counts must be whole numbers >= 0, got {n!r}.")
+    return c

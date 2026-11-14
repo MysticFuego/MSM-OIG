@@ -35,6 +35,9 @@ from .config import SIZES, Island, Kind, Lock
 from .grid import Axis, Height, Pos, find_axis, fits, load_grid, square
 
 ARRANGE_GAP = 0.01
+# When every structure is mirrored, arrange pins each mirror pair directly (a
+# much easier model: ~5x faster and steadier), so it can aim this close.
+ARRANGE_GAP_MIRRORED = 0.002
 ARRANGE_PATIENCE = 20       # arrange stops after this many seconds without a real improvement ...
 ARRANGE_MIN_GAIN = 0.0005   # ... "real" = at least 0.05% better
 PACK_MIN_SECS = 5           # packing always gets at least this long, even with a short time limit
@@ -45,6 +48,8 @@ PACK_WORKERS = 16           # packing uses at least this many workers if the mac
 # tidiest arrangements. Packing is the exception (see PACK_WORKERS).
 AUTO_MAX_WORKERS = 8
 SYMMETRIC_PASS_MAX = 60     # cap on each "every structure mirrored" attempt
+BAND_STAGE_MAX = 60         # cap on the quick back-band maximise (only the all-spots search proves anything)
+SIDE_STEP_MAX = 30          # cap on naming structures and choosing trios
 # Structures aim for the back part of the island: the "every structure
 # mirrored" attempt and the arrange step try these spots first (speed). The
 # spots step 1 and the mirror step used, and their mirrors, are always added.
@@ -113,19 +118,20 @@ def solve(island: Island, *, time_limit: float | None = None, arrange_time_limit
     """
     Solve one island. time_limit=None runs packing and symmetry until proven
     best; arrange_time_limit caps only the cosmetic last step. workers=None
-    picks the number for this computer (see auto_workers); a number overrides it.
+    picks the number for this computer (see auto_workers), with extra workers
+    for packing (see _pack_workers); a number is used for every step as given.
     trio_gap: how many tiles may separate the members of a trio (0 = touching).
     Raises ValueError for bad settings and RuntimeError if nothing fits.
     """
     for label, t in (("time_limit", time_limit), ("arrange_time_limit", arrange_time_limit)):
         if t is not None and t <= 0:
             raise ValueError(f"{label} must be more than 0 seconds, or None for no limit; got {t}.")
-    if int(trio_gap) < 0:
-        raise ValueError(f"trio_gap must be 0 or more tiles; got {trio_gap}.")
+    trio_gap = _whole(trio_gap, "trio_gap", "0 or more tiles", low=0)
     if workers is None:
         workers = auto_workers()
-    elif int(workers) < 1:
-        raise ValueError(f"workers must be at least 1, or None for automatic; got {workers}.")
+        pack_workers = _pack_workers(workers)
+    else:
+        workers = pack_workers = _whole(workers, "workers", "at least 1, or None for automatic", low=1)
     t0 = time.time()
     say = (lambda m: print(f"[{datetime.now():%H:%M:%S}] {island.name}: {m}", flush=True)) if log else (lambda m: None)
 
@@ -141,11 +147,11 @@ def solve(island: Island, *, time_limit: float | None = None, arrange_time_limit
     spots = {s: fits(grid, s) for s in SIZES}
     _check_locks(island.name, grid, kinds, locks)
     say(f"{n_open} open tiles, mirror axis {axis.kind} c={axis.c} ({axis.matched}/{axis.total} tiles mirror),"
-        f" {workers} workers ({_pack_workers(workers)} for packing)")
+        f" {workers} workers ({pack_workers} for packing)")
 
     # ---- 1. pack ---------------------------------------------------------- #
     pack_limit = None if time_limit is None else max(PACK_MIN_SECS, time_limit * (0.4 if symmetry else 0.6))
-    layout, pack = _pack(grid, kinds, locks, spots, island, height, pack_limit, _pack_workers(workers))
+    layout, pack = _pack(grid, kinds, locks, spots, island, height, pack_limit, pack_workers)
     out = Layout(island, grid, axis, height, kinds, layout, packing_optimal=pack["optimal"])
     if island.income_mode:
         out.income, out.income_bound = pack["value"], pack["bound"]
@@ -192,24 +198,30 @@ def solve(island: Island, *, time_limit: float | None = None, arrange_time_limit
     out.seconds["arrange"] = time.time() - t_arr
     if res is not None:
         layout, out.arrange_gap = res
-    say(f"arranged ({out.arrange_gap or 0:.1%} from the solver's bound) | {out.seconds['arrange']:.1f}s")
+        say(f"arranged ({out.arrange_gap:.1%} from the solver's bound) | {out.seconds['arrange']:.1f}s")
+    else:
+        say(f"arrange found nothing in time; keeping the previous layout | {out.seconds['arrange']:.1f}s")
 
-    # trios: label groups of 3 touching collection monsters (positions never move)
+    def side_cap():  # naming / trios: short, but still inside the time limit
+        return SIDE_STEP_MAX if left() is None else min(SIDE_STEP_MAX, left())
+
+    # trios: label groups of 3 close collection monsters (positions never move)
     wanted = {int(s): int(n) for s, n in island.trios.items() if int(n) > 0}
     if wanted:
-        out.trio_gap = int(trio_gap)
+        out.trio_gap = trio_gap
         layout, out.trios = _finish_trios(layout, wanted, height, workers, back={k.name for k in kinds if k.back},
-                                          gap=out.trio_gap)
+                                          gap=out.trio_gap, cap=side_cap())
         say("trios kept together: " + ", ".join(f"{s}x{s} {f}/{w}" for s, (f, w) in sorted(out.trios.items(),
                                                                                        reverse=True)))
 
-    layout, out.same_type = _name_structures(layout, kinds, locks, axis, workers)
+    layout, out.same_type = _name_structures(layout, kinds, locks, axis, workers, cap=side_cap())
     out.placements = layout
     if symmetry and structures:  # count on the final layout (arrange may have mirrored more)
+        total = out.structures_total
         out.mirrored = count_mirrored(layout, axis)
-        bound = out.structures_total if out.mirrored_bound is None else out.mirrored_bound
-        out.mirrored_bound = max(out.mirrored, bound)
-        out.symmetry_optimal = out.symmetry_optimal or out.mirrored == out.structures_total
+        bound = total if out.mirrored_bound is None else out.mirrored_bound
+        out.mirrored_bound = min(total, max(out.mirrored, bound))
+        out.symmetry_optimal = out.symmetry_optimal or out.mirrored >= out.mirrored_bound
     out.seconds["total"] = time.time() - t0
     problems = check(out)
     if problems:  # should never happen; refuse to hand back a broken layout
@@ -243,11 +255,24 @@ def physical_cores() -> int:
 
 def _pack_workers(workers: int) -> int:
     """
-    Packing uses at least PACK_WORKERS when the machine has them: with 16
-    workers CP-SAT adds bound-proving strategies that 8 lack (Ethereal: proven
-    in ~80s instead of ~450s). Usually packing takes seconds either way.
+    With workers=None, packing uses at least PACK_WORKERS when the machine has
+    them: with 16 workers CP-SAT adds bound-proving strategies that 8 lack
+    (Ethereal: proven in ~80s instead of ~450s). Usually packing takes seconds
+    either way. A number given for workers is used as is.
     """
     return max(int(workers), min(PACK_WORKERS, os.cpu_count() or 1))
+
+
+def _whole(x, label, rule, low):
+    """x as a whole number >= low, or a ValueError that says what's allowed."""
+    try:
+        n = int(x)
+        ok = not isinstance(x, bool) and n == x
+    except (TypeError, ValueError):
+        ok = False
+    if not ok or n < low:
+        raise ValueError(f"{label} must be a whole number, {rule}; got {x!r}.")
+    return n
 
 
 def _pack(grid, kinds, locks, spots, island, height, time_limit, workers):
@@ -377,17 +402,7 @@ def _mirror_step(grid, height, skinds, spools, slocks, structures, axis, spots, 
     def model(pools, symmetric, hint):
         m, v = _kind_model(grid, kinds_m, pools, mlocks)
         if symmetric:
-            for k in structures:
-                vm = v[k.name]
-                for p, var in vm.items():
-                    mp = axis.mirror_square(*p, k.size)
-                    if mp == p:
-                        continue
-                    if mp in vm:
-                        if p < mp:
-                            m.Add(var == vm[mp])
-                    else:
-                        m.Add(var == 0)
+            _pin_mirror_pairs(m, v, structures, axis)
         _hint(m, v, hint)
         return m, v
 
@@ -432,14 +447,17 @@ def _mirror_step(grid, height, skinds, spools, slocks, structures, axis, spots, 
         last = i == len(stages) - 1
         m, v = model(pools, False, hint)
         m.Maximize(sum(_mirror_terms(m, v, structures, axis, hint=hint)))
-        solver, status, secs = _run(m, share(1.0 if last else 0.5), workers, on_improve=progress)
+        cap = share(1.0) if last else (BAND_STAGE_MAX if budget_end is None else min(BAND_STAGE_MAX, share(0.5)))
+        solver, status, secs = _run(m, cap, workers, on_improve=progress)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             break
         value = int(round(solver.ObjectiveValue()))
         if last:  # only a search over every spot gives a true bound
-            bound = int(solver.BestObjectiveBound() + 1e-6)
-        best = (solver, v, value, last and status == cp_model.OPTIMAL)
+            bound = min(total, int(solver.BestObjectiveBound() + 1e-6))
         say(f"mirrored {value}/{total} on {label} spots | {secs:.1f}s")
+        if best is not None and value < best[2]:  # out of time before matching the earlier stage: keep it
+            break
+        best = (solver, v, value, last and status == cp_model.OPTIMAL)
         if value == total:
             break
         hint = _extract(solver, v, kinds_m, mlocks)
@@ -492,7 +510,7 @@ def _rename_locks(locks, new_of):
     return [Lock(new_of.get(l.kind, l.kind), l.x, l.y) for l in locks]
 
 
-def _name_structures(layout, kinds, locks, axis, workers):
+def _name_structures(layout, kinds, locks, axis, workers, cap=SIDE_STEP_MAX):
     """
     Hand the structure names out over the structure spots (sizes fixed), so as
     many as possible have the same type in their mirror spot. Locked ones keep
@@ -527,7 +545,7 @@ def _name_structures(layout, kinds, locks, axis, workers):
                     m.AddImplication(both, a[k.name, mp])
                     terms.append(2 * both)
         m.Maximize(sum(terms))
-        solver, status, _ = _run(m, 30, workers)
+        solver, status, _ = _run(m, cap, workers)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             raise RuntimeError(f"could not name the {s}x{s} structures")
         same_type += int(round(solver.ObjectiveValue()))
@@ -629,6 +647,21 @@ def _kind_model(grid, kinds, pools, locks):
     return m, v
 
 
+def _pin_mirror_pairs(m, v, structures, axis):
+    """Every structure mirrored: a structure in a spot exactly when one is in its mirror spot."""
+    for k in structures:
+        vm = v[k.name]
+        for p, var in vm.items():
+            mp = axis.mirror_square(*p, k.size)
+            if mp == p:
+                continue
+            if mp in vm:
+                if p < mp:
+                    m.Add(var == vm[mp])
+            else:
+                m.Add(var == 0)
+
+
 def _mirror_terms(m, v, structures, axis, hint=None):
     """
     Terms summing to the number of structures with a same-type partner in
@@ -682,6 +715,26 @@ def _extract(solver, v, kinds, locks) -> list[Placement]:
             for name, vm in v.items() for (x, y), var in vm.items() if solver.Value(var)]
 
 
+class Cancelled(RuntimeError):
+    """The solve was stopped by cancel()."""
+
+
+_cancel = threading.Event()
+_active, _active_lock = set(), threading.Lock()
+
+
+def cancel():
+    """Stop every solve that is running now, in any thread (they raise Cancelled)."""
+    _cancel.set()
+    with _active_lock:
+        for solver in list(_active):
+            solver.StopSearch()
+
+
+def _reset_cancel():
+    _cancel.clear()
+
+
 class _Progress(cp_model.CpSolverSolutionCallback):
     """Remembers when the objective last improved by at least min_gain (relative)."""
 
@@ -710,10 +763,24 @@ def _run(m, time_limit, workers, gap=None, patience=None, min_gain=0.0, on_impro
         solver.parameters.max_time_in_seconds = float(time_limit)
     if gap:
         solver.parameters.relative_gap_limit = gap
-    if patience is None and on_improve is None:
-        status = solver.Solve(m)
-        return solver, status, solver.WallTime()
+    with _active_lock:
+        _active.add(solver)
+    try:
+        if _cancel.is_set():
+            raise Cancelled("stopped")
+        if patience is None and on_improve is None:
+            status = solver.Solve(m)
+        else:
+            status = _solve_watched(solver, m, patience, min_gain, on_improve)
+    finally:
+        with _active_lock:
+            _active.discard(solver)
+    if _cancel.is_set():
+        raise Cancelled("stopped")
+    return solver, status, solver.WallTime()
 
+
+def _solve_watched(solver, m, patience, min_gain, on_improve):
     watch, done = _Progress(min_gain, on_improve), threading.Event()
 
     def watchdog():
@@ -725,25 +792,32 @@ def _run(m, time_limit, workers, gap=None, patience=None, min_gain=0.0, on_impro
     if patience is not None:
         threading.Thread(target=watchdog, daemon=True).start()
     try:
-        status = solver.Solve(m, watch)
+        return solver.Solve(m, watch)
     finally:
         done.set()
-    return solver, status, solver.WallTime()
 
 
 # --------------------------------------------------------------------------- #
 # 3. arrange
 # --------------------------------------------------------------------------- #
 def _arrange(grid, height, front, skinds, spools, slocks, structures, axis, mirrored, layout, limit, workers):
-    """The arrange model (counts and mirrored structures kept). Returns (placements, gap) or None."""
+    """
+    The arrange model (counts and mirrored structures kept). With every
+    structure mirrored, each structure spot is simply tied to its mirror spot
+    (much faster than counting mirrored pairs). Returns (placements, gap) or None.
+    """
     m, v = _kind_model(grid, skinds, spools, slocks)
-    if mirrored:
+    gap = ARRANGE_GAP
+    if mirrored and mirrored == sum(k.count for k in structures):
+        _pin_mirror_pairs(m, v, structures, axis)
+        gap = ARRANGE_GAP_MIRRORED
+    elif mirrored:
         m.Add(sum(_mirror_terms(m, v, structures, axis, hint=layout)) >= mirrored)
     by_name = {k.name: k for k in skinds}
     m.Maximize(sum(_preference(by_name[name], height, front, x, y) * var
                    for name, vm in v.items() for (x, y), var in vm.items()))
     _hint(m, v, layout)
-    solver, status, _ = _run(m, limit, workers, gap=ARRANGE_GAP, patience=ARRANGE_PATIENCE,
+    solver, status, _ = _run(m, limit, workers, gap=gap, patience=ARRANGE_PATIENCE,
                              min_gain=ARRANGE_MIN_GAIN)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
@@ -770,12 +844,14 @@ def close(a: Placement, b: Placement, gap: int) -> bool:
     return touching(a, b) if gap <= 0 else tiles_apart(a, b) <= gap
 
 
-def _choose_trios(pieces, want, preferred=None, workers=8, gap=0):
+def _choose_trios(pieces, want, preferred=None, workers=8, gap=0, cap=SIDE_STEP_MAX):
     """
     Up to `want` disjoint groups of 3 close squares among `pieces` (same size;
     one square of each group is close to the other two: touching, or at most
     `gap` tiles apart). preferred[i]: use piece i if possible (fewer swaps).
-    Returns groups as tuples of indices.
+    Locked collection pieces can't swap, so every other piece in a group needs
+    an unlocked collection piece to come from (or to stay). Returns groups as
+    tuples of indices.
     """
     if want <= 0:
         return []
@@ -794,6 +870,10 @@ def _choose_trios(pieces, want, preferred=None, workers=8, gap=0):
     for vs in uses.values():
         m.AddAtMostOne(vs)
     m.Add(sum(t.values()) <= want)
+    fixed = [p.locked and p.group == "collection" for p in pieces]
+    if any(fixed):
+        m.Add(sum(sum(not fixed[i] for i in tr) * var for tr, var in t.items())
+              <= sum(p.group == "collection" and not p.locked for p in pieces))
 
     def score(tr):  # most trios; then ones that really touch (spacing only when needed); fewest swaps; tightest
         pairs = ((tr[0], tr[1]), (tr[0], tr[2]), (tr[1], tr[2]))
@@ -802,32 +882,35 @@ def _choose_trios(pieces, want, preferred=None, workers=8, gap=0):
                     for a, b in pairs)
         return 1_000_000 + 10_000 * touch + 100 * sum(preferred[i] for i in tr) + tight
     m.Maximize(sum(score(tr) * var for tr, var in t.items()))
-    solver, status, _ = _run(m, 30, workers)
+    solver, status, _ = _run(m, cap, workers)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return []
     return [tr for tr, var in t.items() if solver.Value(var)]
 
 
-def _finish_trios(layout, wanted, height, workers, back=frozenset(), gap=0):
+def _finish_trios(layout, wanted, height, workers, back=frozenset(), gap=0, cap=SIDE_STEP_MAX):
     """
-    Label the trios: among the unlocked
-    non-structure squares of that size, pick close groups of 3 (see close) and put
-    collection monsters there, swapping with same-size extras / fill if
-    needed (positions never change, so income and symmetry are untouched).
+    Label the trios: among the non-structure squares of that size (locked
+    ones only if they are collection monsters), pick close groups of 3 (see
+    close) and put collection monsters there, swapping with same-size extras /
+    fill if needed (positions never change, so income and symmetry are
+    untouched; locked pieces never change kind).
     Then number every trio 1, 2, ... biggest size first, back to front.
     back: names of back-pulled kinds. Returns (placements, {size: (kept together, wanted)}).
     """
     layout = list(layout)
     result = {}
     for s, want in wanted.items():
-        idx = [i for i, p in enumerate(layout) if p.s == s and p.group != "structure" and not p.locked]
+        idx = [i for i, p in enumerate(layout)
+               if p.s == s and p.group != "structure" and (not p.locked or p.group == "collection")]
         coll = [i for i in idx if layout[i].group == "collection"]
         want = min(want, len(coll) // 3)
         pieces = [layout[i] for i in idx]
-        groups = _choose_trios(pieces, want, [p.group == "collection" for p in pieces], workers, gap)
+        groups = _choose_trios(pieces, want, [p.group == "collection" for p in pieces], workers, gap, cap)
         in_trio = {idx[j]: g for g, tr in enumerate(groups) for j in tr}
         displaced = [layout[i] for i in in_trio if layout[i].group != "collection"]
-        free_coll = sorted((i for i in coll if i not in in_trio), key=lambda i: height.depth2(layout[i].x, layout[i].y, s))
+        free_coll = sorted((i for i in coll if i not in in_trio and not layout[i].locked),
+                           key=lambda i: height.depth2(layout[i].x, layout[i].y, s))
         coll_kind = layout[coll[0]].kind if coll else f"collection {s}x{s}"
         # displaced pieces take former collection spots: back-pulled ones the furthest back
         back_first = [p for p in displaced if p.kind in back]
@@ -913,8 +996,9 @@ def check(layout: Layout) -> list[str]:
             groups[p.trio].append(p)
     for t, ps in groups.items():
         ok = len(ps) == 3 and len({p.s for p in ps}) == 1 and all(p.group == "collection" for p in ps)
-        linked = sum(close(a, b, layout.trio_gap) for a, b in ((ps[0], ps[1]), (ps[0], ps[2]), (ps[1], ps[2])))
-        if not ok or linked < 2:  # 3 squares are connected when at least 2 of the pairs are close
+        if ok:
+            ok = sum(close(a, b, layout.trio_gap) for a, b in ((ps[0], ps[1]), (ps[0], ps[2]), (ps[1], ps[2]))) >= 2
+        if not ok:  # 3 squares are connected when at least 2 of the pairs are close
             problems.append(f"trio {t} is not 3 close collection monsters of one size")
     isl = layout.island
     if isl.income_mode and isl.beds is not None and layout.beds_used != int(isl.beds):
