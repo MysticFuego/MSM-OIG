@@ -5,14 +5,18 @@ Island settings, as written in the notebook's ISLANDS cell.
         "csv": "Original.csv",            # island mask
         "excel": "Plant.xlsx",            # output file (default: <name>.xlsx)
         "structures": {4: 3, 3: 8, 1: 10},   # count by size, or named (see below)
-        "monsters": {4: 3, 3: 3, 2: 52, 1: 23},  # your collection, by size
-        "trios": {4: 1, 3: 1, 2: 14, 1: 3},   # of those, groups of 3 identical monsters kept side by side
+        "trios": {3: 1, 2: 14, 1: 3},     # your collection, by size: groups of 3 identical monsters
+                                          #   (kept side by side) ...
+        "individuals": {4: 3, 2: 10, 1: 14},  # ... and every other monster
         "beds": 36,                       # income mode: extras use exactly this many beds
         "catalog": [ {extra}, ... ],      # income mode: optional extras (see Extra)
         "fill": 2,                        # fill mode only: size of the fill squares
         "locked": [ {lock}, ... ],        # pieces pinned to a cell (see Lock)
         "flip_up": False,                 # True if the 'in-game up' arrow points the wrong way
     }
+
+Instead of "individuals", "monsters" can give the whole collection by size,
+trios included ("monsters": {2: 52}, "trios": {2: 14} = 14 trios + 10 others).
 
 With a catalog the island is in *income mode* (the solver picks extras for the
 most income); without one it is in *fill mode* (as many fill squares as fit).
@@ -58,7 +62,8 @@ class Island:
     name: str
     csv: str = "Original.csv"
     structures: dict | list = field(default_factory=dict)
-    monsters: dict = field(default_factory=dict)
+    monsters: dict = field(default_factory=dict)      # whole collection (trios included) ...
+    individuals: dict = field(default_factory=dict)   # ... or just the monsters not in a trio
     excel: str | None = None
     beds: int | None = None
     catalog: list = field(default_factory=list)
@@ -98,8 +103,19 @@ class Island:
         for name, s, n in items:
             kinds.append(Kind(str(name), "structure", _size(s, name), _count(n, name), back=True))
 
-        for s, n in self.monsters.items():
-            kinds.append(Kind(f"collection {s}x{s}", "collection", _size(s, "monsters"), _count(n, "monsters")))
+        if self.monsters and self.individuals:
+            raise ValueError(f"{self.name}: give either 'monsters' (every monster, trios included) or"
+                             f" 'individuals' (the monsters not in a trio), not both.")
+        trios = {_size(s, "trios"): _count(n, "trios") for s, n in self.trios.items()}
+        if self.monsters:
+            collection = {_size(s, "monsters"): _count(n, "monsters") for s, n in self.monsters.items()}
+        else:  # trios + individuals
+            collection = {s: 3 * n for s, n in trios.items()}
+            for s, n in self.individuals.items():
+                s = _size(s, "individuals")
+                collection[s] = collection.get(s, 0) + _count(n, "individuals")
+        for s in sorted(collection, reverse=True):
+            kinds.append(Kind(f"collection {s}x{s}", "collection", s, collection[s]))
 
         if self.beds is not None and not self.catalog:
             warnings.warn(f"{self.name}: 'beds' is ignored without a 'catalog' (fill mode).", stacklevel=3)
@@ -125,12 +141,10 @@ class Island:
         else:
             kinds.append(Kind(f"fill {self.fill}x{self.fill}", "fill", _size(self.fill, "fill")))
 
-        for s, n in self.trios.items():
-            s, n = _size(s, "trios"), _count(n, "trios")
-            have = sum(k.count for k in kinds if k.group == "collection" and k.size == s)
-            if 3 * n > have:
+        for s, n in trios.items():
+            if 3 * n > collection.get(s, 0):
                 raise ValueError(f"{self.name}: {n} trios of {s}x{s} need {3 * n} monsters of that size,"
-                                 f" but 'monsters' has {have}.")
+                                 f" but 'monsters' has {collection.get(s, 0)}.")
 
         names = [k.name for k in kinds]
         dupes = {n for n in names if names.count(n) > 1}

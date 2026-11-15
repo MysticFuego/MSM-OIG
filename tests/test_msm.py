@@ -266,6 +266,20 @@ class MsmTests(unittest.TestCase):
             broken = msm.Layout(**{**layout.__dict__, "placements": bad})
             self.assertTrue(any(f"trio {bad[i].trio}" in problem for problem in msm.check(broken)))
 
+    def test_trios_plus_individuals_is_the_whole_collection(self):
+        def collection(**settings):
+            return sorted((k.size, k.count) for k in msm.Island.from_dict("T", settings).kinds(100)
+                          if k.group == "collection")
+        whole = collection(monsters={4: 3, 2: 14 * 3 + 10, 1: 3 * 3 + 14}, trios={2: 14, 1: 3})
+        split = collection(trios={2: 14, 1: 3}, individuals={4: 3, 2: 10, 1: 14})
+        self.assertEqual(whole, split)
+        self.assertEqual(split, [(1, 23), (2, 52), (4, 3)])
+        self.assertEqual(collection(trios={3: 2}), [(3, 6)])  # trios alone
+        with self.assertRaisesRegex(ValueError, "not both"):
+            collection(monsters={2: 4}, individuals={2: 1})
+        layout = self.solve(monsters={}, trios={2: 1}, individuals={2: 1, 1: 3})
+        self.assertEqual(sum(p.s == 2 and p.group == "collection" for p in layout.placements), 4)
+
     def test_too_many_trios_rejected(self):
         with self.assertRaisesRegex(ValueError, "trios of 2x2 need 6"):
             self.solve(monsters={2: 4}, trios={2: 2})
